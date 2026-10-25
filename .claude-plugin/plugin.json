@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "epa-drinking-water-mcp-server",
+  "version": "0.1.0",
+  "description": "Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/epa-drinking-water-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/epa-drinking-water-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "mcpServers": {
+    "epa-drinking-water-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "@cyanheads/epa-drinking-water-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}
