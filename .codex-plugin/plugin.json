@@ -3,19 +3,19 @@
   "version": "0.1.0",
   "description": "Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "Casey Hand",
+    "name": "cyanheads",
     "email": "casey@caseyjhand.com",
-    "url": "https://caseyjhand.com"
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/epa-drinking-water-mcp-server#readme",
   "repository": "https://github.com/cyanheads/epa-drinking-water-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "typescript", "bun", "stdio", "streamable-http", "epa", "drinking-water", "sdwis", "ucmr", "pfas", "water-quality"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "epa-drinking-water-mcp-server",
     "shortDescription": "Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP.",
-    "longDescription": "Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP.",
+    "longDescription": "Read public EPA drinking-water records without an API key: resolve water systems, inspect contact-free inventory and service membership, retrieve historical SDWA violations and enforcement actions, and select Lead and Copper Rule summaries or UCMR 5 occurrence measurements. Responses retain provenance, source uncertainty, and continuation metadata. Optional DuckDB staging in npm or Docker supports read-only SQL over bounded public-data partitions; the Claude Desktop bundle supports the six EPA-reading tools. Quarterly records and limited monitoring participation do not establish current compliance or household tap-water safety.",
     "developerName": "cyanheads",
     "category": "research",
     "capabilities": ["Read"],

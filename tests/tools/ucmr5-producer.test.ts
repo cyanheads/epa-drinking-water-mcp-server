@@ -45,7 +45,7 @@ afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.close()));
   if (canvas) await canvas.canvas.shutdown(canvas.ctx);
   canvas = undefined;
-  initCanvasService(undefined);
+  initCanvasService(undefined, 25000);
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -53,7 +53,7 @@ afterEach(async () => {
 describe('real UCMR producer through tool contract', () => {
   it('marks an entire first staged selection complete despite a smaller preview', async () => {
     canvas = fixture();
-    initCanvasService(canvas.canvas);
+    initCanvasService(canvas.canvas, 25000);
     install([occurrence(), occurrence({ SampleID: 'second' })]);
     expect(
       data(await runToolContract(tool, { ...scope, stage: true, limit: 1, stage_max_rows: 2 })),
@@ -362,7 +362,7 @@ describe('real UCMR producer through tool contract', () => {
 
   it('stages beyond preview with separate complete companion relations and exact partitions', async () => {
     canvas = fixture();
-    initCanvasService(canvas.canvas);
+    initCanvasService(canvas.canvas, 25000);
     install([
       occurrence(),
       occurrence({ SampleID: 'zero', AnalyticalResultsSign: '=', AnalyticalResultValue: '0' }),
@@ -426,7 +426,7 @@ describe('real UCMR producer through tool contract', () => {
 
   it('keeps the failed staged partition cursor retryable when companion admission exceeds capacity', async () => {
     canvas = fixture();
-    initCanvasService(canvas.canvas);
+    initCanvasService(canvas.canvas, 25000);
     install([occurrence(), occurrence({ SampleID: 'second' })]);
     const input = { ...scope, stage: true, limit: 1, stage_max_rows: 1 };
     const first = data(await runToolContract(tool, input));

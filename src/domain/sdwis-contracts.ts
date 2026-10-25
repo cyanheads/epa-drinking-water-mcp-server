@@ -140,7 +140,7 @@ export function sortColumns(table: Table): string[] {
 }
 /** Parse a real ISO calendar date without timezone inference. */
 export function calendarDate(value: string): string {
-  const match = /^(\d{4}-\d{2}-\d{2})(?: 00:00:00)?$/.exec(value);
+  const match = /^(\d{4}-\d{2}-\d{2})(?: (?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)?$/.exec(value);
   if (!match?.[1] || new Date(`${match[1]}T00:00:00Z`).toISOString().slice(0, 10) !== match[1])
     throw new Error('Invalid calendar date');
   return match[1];
@@ -159,6 +159,7 @@ export function parseRows(table: Table, input: unknown): PublicRow[] {
       if (key.endsWith('_date') && typeof value === 'string') {
         try {
           row[key] = calendarDate(value);
+          if (value.length > 10 && !value.endsWith(' 00:00:00')) row[`${key}_raw`] = value;
         } catch (cause) {
           throw serviceUnavailable(
             'EPA returned an invalid calendar date.',

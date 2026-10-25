@@ -2,7 +2,28 @@
  * @fileoverview Strict DMAP network fixtures with assertion failures retained outside retries.
  * @module tests/services/sdwis/sdwis-fixtures
  */
+import MarkdownIt from 'markdown-it';
 import { expect, vi } from 'vitest';
+
+const commonmark = new MarkdownIt('commonmark');
+
+/** Read visible CommonMark text independently of the production Markdown encoder. */
+export function renderedText(text: string): string {
+  return commonmark
+    .parse(text, {})
+    .flatMap((block) => {
+      expect(['paragraph_open', 'inline', 'paragraph_close']).toContain(block.type);
+      return (block.children ?? []).map((token) => {
+        expect(['text', 'softbreak', 'hardbreak', 'link_open', 'link_close']).toContain(token.type);
+        return token.type === 'softbreak' || token.type === 'hardbreak'
+          ? '\n'
+          : token.type === 'text'
+            ? token.content
+            : '';
+      });
+    })
+    .join('');
+}
 
 /** One expected request, including its full production URL path. */
 export interface Exchange {
@@ -58,7 +79,7 @@ export async function paced<T>(operation: Promise<T>): Promise<T> {
 export function expectParity(result: { structuredContent?: unknown; content: unknown[] }) {
   const lines = result.content.flatMap((block) => {
     if (block && typeof block === 'object' && 'text' in block && typeof block.text === 'string')
-      return block.text.split('\n');
+      return renderedText(block.text).split('\n');
     return [];
   });
   const visit = (value: unknown, path: string) => {

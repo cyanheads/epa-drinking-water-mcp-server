@@ -26,7 +26,9 @@ export const dataframeDescribeTool = tool('sdwis_dataframe_describe', {
     pointer: z.string().describe('Executable describe/query next steps.'),
     items: z
       .array(z.record(z.string(), z.unknown()))
-      .describe('Live engine table-column metadata with source lineage.'),
+      .describe(
+        'One entry per table column: table_name, row_count, expires_at, column name/type/nullability, source filters, provenance, relation and completeness, plus any source continuation.',
+      ),
     returned: z.number().int().describe('Entries in this response.'),
     totalCount: z.number().int().describe('Current matching metadata entries.'),
     has_more: z.boolean().describe('More metadata entries remain.'),

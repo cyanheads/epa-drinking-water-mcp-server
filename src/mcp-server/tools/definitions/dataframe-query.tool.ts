@@ -8,7 +8,7 @@ import { getCanvasService } from '@/services/dataframe/canvas-service.js';
 /** Query pagination reads an immutable bounded result, never reruns SQL for a cursor. */
 export const dataframeQueryTool = tool('sdwis_dataframe_query', {
   description:
-    'Run one read-only SELECT, WITH or FROM query against staged tables in a canvas_id you already hold. Call sdwis_dataframe_describe first for exact table names and columns. No file, network or system-catalog access. Results retain at most 25000 rows with immutable inline/text continuations; source incompleteness survives aggregation. Narrow SQL when the framework reports truncation.',
+    'Run one read-only SELECT, WITH or FROM query against staged tables in a canvas_id you already hold. Call sdwis_dataframe_describe first for exact table names and columns. No file, network or system-catalog access. Results retain at most the configured canvas row ceiling or 25000 rows, whichever is lower, with immutable inline/text continuations; source incompleteness survives aggregation. Narrow SQL when the framework reports truncation.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     canvas_id: CanvasIdSchema,
@@ -30,8 +30,16 @@ export const dataframeQueryTool = tool('sdwis_dataframe_query', {
       .int()
       .describe('Framework materialized result count; capped when truncated.'),
     truncated: z.boolean().describe('Framework result exceeds the retained row cap.'),
-    source_complete: z.boolean().describe('All live source partitions are complete.'),
-    provenance: z.array(z.unknown()).describe('Source attribution and limitations.'),
+    source_complete: z
+      .boolean()
+      .describe(
+        'Every live source partition in the canvas is complete, including tables this SQL does not reference; aggregation cannot establish completeness.',
+      ),
+    provenance: z
+      .array(z.unknown())
+      .describe(
+        'Distinct source provenance objects with source, URL, retrieved_at, consistency and caveats, plus publication or HTTP validators when available.',
+      ),
     has_more: z.boolean().describe('More retained rows or record text are available.'),
     next_cursor: optionalText('Exact retained-result continuation.'),
     notices: z.array(z.string()).describe('Scope and completeness guidance.'),

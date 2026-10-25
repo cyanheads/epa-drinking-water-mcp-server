@@ -21,7 +21,7 @@ export function fixture() {
       sweeperIntervalMs: 0,
     }),
   );
-  return { canvas, service: new CanvasService(canvas), ctx: createMockContext() };
+  return { canvas, service: new CanvasService(canvas, 25000), ctx: createMockContext() };
 }
 /** Source lineage intentionally remains partial after any SQL aggregation. */
 export function output(complete = false): SourceOutput {

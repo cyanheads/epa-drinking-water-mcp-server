@@ -39,7 +39,7 @@ export const pagingFields = {
 /** Geographic membership selectors, resolved before querying fact tables. */
 export const geographyFields = {
   pwsid: optionalText(
-    'Exact nine-character alphanumeric PWSID, including numeric tribal prefixes and alphabetic suffixes.',
+    'Exact nine-character alphanumeric PWSID from sdwis_search_water_systems; numeric tribal prefixes and alphabetic suffixes are valid.',
   ),
   state: optionalText(
     'Reported WATER_SYSTEM legal-entity postal state or territory name/code; not a physical service boundary.',
@@ -51,7 +51,7 @@ export const geographyFields = {
 /** Analytical interval selectors use inclusive source calendar-date overlap. */
 export const dateFields = {
   date_from: optionalText(
-    'Inclusive YYYY-MM-DD lower date; violations use compliance-period overlap, LCR sample-period overlap, actions enforcement date.',
+    'Inclusive YYYY-MM-DD lower date; violations use compliance-period overlap, LCR sample-period overlap, actions enforcement date and UCMR collection date.',
   ),
   date_to: optionalText(
     'Inclusive YYYY-MM-DD upper date; unknown source dates do not match a requested date interval.',

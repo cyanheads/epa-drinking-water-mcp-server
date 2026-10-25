@@ -3,6 +3,7 @@
  * @module domain/source-output
  */
 import { z } from '@cyanheads/mcp-ts-core';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 
 /** JSON-safe source values, including sparse source nulls. */
 export const rowSchema = z
@@ -85,15 +86,24 @@ export function formatSource(result: Record<string, unknown>): { type: 'text'; t
   const lines: string[] = [];
   const visit = (value: unknown, path: string) => {
     if (Array.isArray(value)) {
-      if (!value.length) lines.push(`${path} = []`);
+      if (!value.length) lines.push(escapeMarkdownInline(`${path} = []`));
       for (const [index, child] of value.entries()) visit(child, `${path}[${index}]`);
     } else if (value !== null && typeof value === 'object') {
       const entries = Object.entries(value);
-      if (!entries.length) lines.push(`${path} = {}`);
+      if (!entries.length) lines.push(escapeMarkdownInline(`${path} = {}`));
       for (const [key, child] of entries)
         if (child !== undefined)
           visit(child, path ? `${path}.${JSON.stringify(key)}` : JSON.stringify(key));
-    } else if (value !== undefined) lines.push(`${path} = ${JSON.stringify(value)}`);
+    } else if (value !== undefined) {
+      const serialized = JSON.stringify(value);
+      const protocol =
+        typeof value === 'string' && !/[\r\n]/.test(value) ? URL.parse(value)?.protocol : undefined;
+      const rendered =
+        protocol === 'http:' || protocol === 'https:'
+          ? markdownLink(serialized, String(value))
+          : escapeMarkdownInline(serialized);
+      lines.push(`${escapeMarkdownInline(path)} = ${rendered}`);
+    }
   };
   visit(result, '');
   return [{ type: 'text', text: lines.join('\n') }];

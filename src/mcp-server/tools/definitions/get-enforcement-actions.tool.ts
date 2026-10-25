@@ -23,7 +23,7 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
     pwsid: z
       .string()
       .describe(
-        'Exact nine-character alphanumeric PWSID; unknown but shaped IDs return no matches.',
+        'Exact nine-character alphanumeric PWSID from sdwis_search_water_systems; unknown but shaped IDs return no matches.',
       ),
     section: z
       .enum(['actions', 'associations'])
@@ -32,7 +32,7 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
         'Actions by default; associations has independent paging and does not accept action/date predicates.',
       ),
     violation_id: optionalText(
-      'Exact source violation identifier; always joined together with PWSID.',
+      'Exact violation_id returned by sdwis_get_violations; always joined together with PWSID.',
     ),
     ...dateFields,
     ...pagingFields,

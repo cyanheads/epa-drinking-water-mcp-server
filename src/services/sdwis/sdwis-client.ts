@@ -86,7 +86,14 @@ export function dmapUrl(table: Table, predicates: Predicate[], first: number, si
     if (index) paths.push('and');
     paths.push(predicate.column, predicate.operator, encodeURIComponent(predicate.value));
   }
-  paths.push('sort', sortColumns(table).join(','), `${first}:${first + size - 1}`, 'json');
+  const ordering = sortColumns(table);
+  // EPA requires explicit directions when a sort contains multiple columns.
+  paths.push(
+    'sort',
+    ordering.length > 1 ? ordering.map((column) => `${column}:asc`).join(',') : ordering.join(','),
+    `${first}:${first + size - 1}`,
+    'json',
+  );
   return new URL(`/dmapservice/${paths.join('/')}`, origin);
 }
 function matches(row: PublicRow, predicate: Predicate): boolean {

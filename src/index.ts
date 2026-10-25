@@ -72,7 +72,7 @@ await createApp({
       throw configurationError(
         'CANVAS_DEFAULT_MEMORY_LIMIT_MB must be at most 512 for this server.',
       );
-    initCanvasService(core.canvas);
+    initCanvasService(core.canvas, core.config.canvas.defaultRowLimit);
     if (core.canvas) setStageProducer((partition, ctx) => getCanvasService().stage(partition, ctx));
     ucmr = initUcmr5Service();
     setUcmrProducer(

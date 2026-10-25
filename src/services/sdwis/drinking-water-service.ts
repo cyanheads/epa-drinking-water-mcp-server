@@ -744,23 +744,23 @@ export async function produceSource(
       const pointer = token(cursor);
       const points = Array.from(JSON.stringify(job.text.row));
       const offset = pointer.offset ?? 0;
-      const chunk: string[] = [];
+      let end = offset;
+      let upper = points.length;
       result.record_identity = identity(job.text.row);
       result.encoding = 'json';
       result.offset = offset;
-      for (let i = offset; i < points.length; i++) {
-        chunk.push(points[i] ?? '');
-        result.text = chunk.join('');
-        result.has_more = i + 1 < points.length;
-        result.next_cursor = sign(job, 'text', i + 1);
-        if (wireBytes(result) >= 23000) {
-          chunk.pop();
-          break;
-        }
+      // Include the exact signed offset token in each logarithmic wire-size probe.
+      while (end < upper) {
+        const candidate = Math.ceil((end + upper) / 2);
+        result.text = points.slice(offset, candidate).join('');
+        result.has_more = candidate < points.length;
+        result.next_cursor = sign(job, 'text', candidate);
+        if (wireBytes(result) < 23000) end = candidate;
+        else upper = candidate - 1;
       }
-      result.text = chunk.join('');
-      result.has_more = offset + chunk.length < points.length;
-      if (result.has_more) result.next_cursor = sign(job, 'text', offset + chunk.length);
+      result.text = points.slice(offset, end).join('');
+      result.has_more = end < points.length;
+      if (result.has_more) result.next_cursor = sign(job, 'text', end);
       else {
         if (job.pending[0] === job.text.row) job.pending.shift();
         job.deliveredRows++;

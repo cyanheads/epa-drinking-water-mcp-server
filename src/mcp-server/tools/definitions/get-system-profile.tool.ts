@@ -18,7 +18,7 @@ export const getSystemProfileTool = tool('sdwis_get_system_profile', {
     pwsid: z
       .string()
       .describe(
-        'Exact nine-character alphanumeric PWSID; numeric tribal prefixes and alphabetic suffixes are valid.',
+        'Exact nine-character alphanumeric PWSID from sdwis_search_water_systems; numeric tribal prefixes and alphabetic suffixes are valid.',
       ),
     section: z
       .enum(['summary', 'geography', 'service_areas', 'treatment'])

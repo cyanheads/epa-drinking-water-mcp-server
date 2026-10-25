@@ -174,14 +174,17 @@ export function createUcmrProducer(
           const points = Array.from(JSON.stringify(row));
           const start = pointer.rowOffset;
           let end = start;
+          let upper = points.length;
           result.encoding = 'json';
           result.offset = start;
           result.record_identity = `${row.pwsid}:${row.sample_id}:${row.contaminant}`;
           result.next_cursor = 'x'.repeat(32);
-          while (end < points.length) {
-            result.text = points.slice(start, end + 1).join('');
-            if (wireBytes(result) >= 23000) break;
-            end++;
+          // Search code-point boundaries rather than rendering every growing prefix.
+          while (end < upper) {
+            const candidate = Math.ceil((end + upper) / 2);
+            result.text = points.slice(start, candidate).join('');
+            if (wireBytes(result) < 23000) end = candidate;
+            else upper = candidate - 1;
           }
           result.text = points.slice(start, end).join('');
           if (end === start && end < points.length)

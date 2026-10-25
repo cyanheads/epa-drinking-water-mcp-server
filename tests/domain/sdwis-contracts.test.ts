@@ -28,14 +28,32 @@ describe('SDWIS public contracts', () => {
       ]),
     ).toEqual([{ pwsid: 'WA1234567', sample_id: 'S', sar_id: '123', sample_measure: null }]);
   });
-  it.each(['2024-02-30', '2023-02-29', '2024-01-01T00:00:00Z', 'not-a-date'])(
-    'rejects invalid source date %s',
-    (value) => {
-      expect(() =>
-        parseRows('violation', [{ pwsid: 'WA1234567', violation_id: 'V', rtc_date: value }]),
-      ).toThrow(expect.objectContaining({ data: { reason: 'upstream_contract_changed' } }));
-    },
-  );
+  it.each([
+    '2024-02-30',
+    '2023-02-29',
+    '2024-01-01T00:00:00Z',
+    '2024-01-01 24:00:00',
+    '2024-01-01 12:60:00',
+    '2024-01-01 12:00:60',
+    'not-a-date',
+  ])('rejects invalid source date %s', (value) => {
+    expect(() =>
+      parseRows('violation', [{ pwsid: 'WA1234567', violation_id: 'V', rtc_date: value }]),
+    ).toThrow(expect.objectContaining({ data: { reason: 'upstream_contract_changed' } }));
+  });
+  it('normalizes a valid nonmidnight EPA timestamp without losing its source text', () => {
+    expect(
+      parseRows('water_system', [
+        { pwsid: 'WA1234567', pws_deactivation_date: '2013-02-19 10:42:29' },
+      ]),
+    ).toEqual([
+      {
+        pwsid: 'WA1234567',
+        pws_deactivation_date: '2013-02-19',
+        pws_deactivation_date_raw: '2013-02-19 10:42:29',
+      },
+    ]);
+  });
   it('normalizes calendar dates and selectors without inferring geography', () => {
     expect(calendarDate('2024-02-29 00:00:00')).toBe('2024-02-29');
     expect(optionalText('optional').parse('  ')).toBeUndefined();

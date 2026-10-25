@@ -136,13 +136,15 @@ export function sourceSchema(table: Table, rows: PublicRow[]): ColumnSchema[] {
 /** Process-local admission is synchronous before every asynchronous operation. */
 export class CanvasService {
   private readonly canvas: DataCanvas;
+  private readonly rowLimit: number;
   private states = new Set<State>();
   private active = 0;
   private waiting: Waiter[] = [];
   private cache = new Map<string, CacheEntry>();
   private cursors = new Map<string, Cursor>();
-  constructor(canvas: DataCanvas) {
+  constructor(canvas: DataCanvas, configuredRowLimit: number) {
     this.canvas = canvas;
+    this.rowLimit = Math.min(configuredRowLimit, 25000);
   }
 
   private sweep(): void {
@@ -268,7 +270,11 @@ export class CanvasService {
     signal: AbortSignal,
   ): Promise<QueryResult> {
     try {
-      return await instance.query(sql, { rowLimit: 25000, denySystemCatalogs: true, signal });
+      return await instance.query(sql, {
+        rowLimit: this.rowLimit,
+        denySystemCatalogs: true,
+        signal,
+      });
     } catch (cause) {
       signal.throwIfAborted();
       if (!(cause instanceof McpError))
@@ -566,7 +572,9 @@ export class CanvasService {
         notices: [
           'Source completeness conservatively includes every live source partition in this canvas, including partitions not referenced by this SQL.',
           ...(entry.result.truncated
-            ? ['The framework retained only 25000 query rows; narrow SQL to retrieve omitted rows.']
+            ? [
+                `The framework retained only ${this.rowLimit} query rows; narrow SQL to retrieve omitted rows.`,
+              ]
             : []),
           ...(input.limit > 100 ? ['Requested limit was clamped to 100.'] : []),
         ],
@@ -593,15 +601,18 @@ export class CanvasService {
           });
         const points = Array.from(JSON.stringify(row));
         let end = textOffset;
+        let upper = points.length;
         output.encoding = 'json';
         output.offset = textOffset;
         output.record_identity = `${key}:${offset}`;
         output.text = '';
         output.next_cursor = 'x'.repeat(32);
-        while (end < points.length) {
-          output.text = points.slice(textOffset, end + 1).join('');
-          if (wireBytes(output) >= 23000) break;
-          end++;
+        // Search code-point boundaries rather than rendering every growing prefix.
+        while (end < upper) {
+          const candidate = Math.ceil((end + upper) / 2);
+          output.text = points.slice(textOffset, candidate).join('');
+          if (wireBytes(output) < 23000) end = candidate;
+          else upper = candidate - 1;
         }
         if (end === textOffset && end < points.length)
           throw validationError('Query metadata exceeds inline capacity; narrow SQL.', {
@@ -683,8 +694,11 @@ export class CanvasService {
 }
 let service: CanvasService | undefined;
 /** Bind the optional framework canvas exactly once during setup. */
-export function initCanvasService(canvas: DataCanvas | undefined): void {
-  service = canvas ? new CanvasService(canvas) : undefined;
+export function initCanvasService(
+  canvas: DataCanvas | undefined,
+  configuredRowLimit: number,
+): void {
+  service = canvas ? new CanvasService(canvas, configuredRowLimit) : undefined;
 }
 /** Requested staging fails explicitly in runtimes without native canvas support. */
 export function getCanvasService(): CanvasService {

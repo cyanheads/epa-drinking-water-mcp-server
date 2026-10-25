@@ -32,6 +32,22 @@ function read(caller = signal()) {
 }
 
 describe('DMAP network boundary', () => {
+  it('uses explicit directions for EPA composite ordering before the inclusive range', async () => {
+    const expectedPath =
+      '/dmapservice/sdwis.violation/pwsid/equals/WA1234567/sort/pwsid:asc,violation_id:asc/1:2/json';
+    http = network([{ path: expectedPath, rows: [{ pwsid: 'WA1234567', violation_id: 'V1' }] }]);
+    await paced(
+      client.readPage(
+        'violation',
+        [{ column: 'pwsid', operator: 'equals', value: 'WA1234567' }],
+        1,
+        2,
+        signal(),
+      ),
+    );
+    expect(http.calls).toEqual([expectedPath]);
+  });
+
   it('encodes a fixed projected path and strips unknown contact fields before retention', async () => {
     http = network([
       {

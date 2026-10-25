@@ -1,4 +1,10 @@
 .env*
+.DS_Store
+**/.DS_Store
+Thumbs.db
+**/Thumbs.db
+__MACOSX/
+**/__MACOSX/
 .mcpregistry_*
 /.claude/
 /.agents/

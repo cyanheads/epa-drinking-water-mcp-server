@@ -23,7 +23,9 @@ export const searchContaminantsTool = tool('sdwis_search_contaminants', {
   input: z.object({
     dataset: z
       .enum(['violations', 'lcr', 'ucmr5'])
-      .describe('Evidence source; incompatible dataset selectors fail before any HTTP request.'),
+      .describe(
+        'Evidence source: violations for SDWA violations, lcr for lead/copper summaries, ucmr5 for occurrence measurements; provide pwsid or state for every dataset.',
+      ),
     ...geographyFields,
     ...dateFields,
     ...pagingFields,

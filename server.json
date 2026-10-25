@@ -16,6 +16,34 @@
       "version": "0.1.0",
       "environmentVariables": [
         {
+          "name": "CANVAS_PROVIDER_TYPE",
+          "description": "Optional SQL staging in the npm runtime: none or duckdb.",
+          "format": "string",
+          "isRequired": false,
+          "default": "none"
+        },
+        {
+          "name": "SDWIS_DATAFRAME_DROP_ENABLED",
+          "description": "Enable removal of staged tables when DataCanvas is enabled.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
+          "name": "CANVAS_DEFAULT_ROW_LIMIT",
+          "description": "SQL retained-row ceiling; the server maximum is 25000.",
+          "format": "string",
+          "isRequired": false,
+          "default": "10000"
+        },
+        {
+          "name": "CANVAS_DEFAULT_MEMORY_LIMIT_MB",
+          "description": "DuckDB memory budget per engine in MiB; maximum 512.",
+          "format": "string",
+          "isRequired": false,
+          "default": "512"
+        },
+        {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
           "format": "string",
@@ -34,6 +62,34 @@
       "runtimeHint": "npx",
       "version": "0.1.0",
       "environmentVariables": [
+        {
+          "name": "CANVAS_PROVIDER_TYPE",
+          "description": "Optional SQL staging in the npm runtime: none or duckdb.",
+          "format": "string",
+          "isRequired": false,
+          "default": "none"
+        },
+        {
+          "name": "SDWIS_DATAFRAME_DROP_ENABLED",
+          "description": "Enable removal of staged tables when DataCanvas is enabled.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
+          "name": "CANVAS_DEFAULT_ROW_LIMIT",
+          "description": "SQL retained-row ceiling; the server maximum is 25000.",
+          "format": "string",
+          "isRequired": false,
+          "default": "10000"
+        },
+        {
+          "name": "CANVAS_DEFAULT_MEMORY_LIMIT_MB",
+          "description": "DuckDB memory budget per engine in MiB; maximum 512.",
+          "format": "string",
+          "isRequired": false,
+          "default": "512"
+        },
         {
           "name": "MCP_TRANSPORT_TYPE",
           "description": "Selects the HTTP transport.",

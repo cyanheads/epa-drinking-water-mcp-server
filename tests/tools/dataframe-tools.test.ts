@@ -15,10 +15,10 @@ import { expectParity } from '../services/sdwis/sdwis-fixtures.js';
 let f: ReturnType<typeof fixture>;
 beforeEach(() => {
   f = fixture();
-  initCanvasService(f.canvas);
+  initCanvasService(f.canvas, 25000);
 });
 afterEach(async () => {
-  initCanvasService(undefined);
+  initCanvasService(undefined, 25000);
   await f.canvas.shutdown(f.ctx);
 });
 function success(result: Awaited<ReturnType<typeof runToolContract>>) {
@@ -81,7 +81,7 @@ describe('dataframe tool contracts', () => {
   });
 
   it('returns disabled-canvas failures on both surfaces without fake handles', async () => {
-    initCanvasService(undefined);
+    initCanvasService(undefined, 25000);
     for (const result of [
       await runToolContract(dataframeDescribeTool, { canvas_id: 'abcdefghij' }),
       await runToolContract(dataframeQueryTool, { canvas_id: 'abcdefghij', sql: 'SELECT 1' }),

@@ -4,9 +4,7 @@
   "version": "0.1.0",
   "description": "Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "cyanheads",
-    "email": "casey@caseyjhand.com",
-    "url": "https://caseyjhand.com"
+    "name": "cyanheads"
   },
   "repository": {
     "type": "git",

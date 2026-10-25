@@ -4,20 +4,30 @@
   "version": "0.1.0",
   "description": "Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "Casey Hand",
+    "name": "cyanheads",
     "email": "casey@caseyjhand.com",
-    "url": "https://caseyjhand.com"
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/epa-drinking-water-mcp-server#readme",
   "repository": "https://github.com/cyanheads/epa-drinking-water-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "typescript", "bun", "stdio", "streamable-http", "epa", "drinking-water", "sdwis", "ucmr", "pfas", "water-quality"],
+  "userConfig": {
+    "CANVAS_PROVIDER_TYPE": { "type": "string", "title": "DataCanvas provider", "description": "Optional SQL staging: none or duckdb. DuckDB requires native bindings in the npm runtime.", "required": false, "default": "" },
+    "SDWIS_DATAFRAME_DROP_ENABLED": { "type": "string", "title": "Enable dataframe removal", "description": "Set true to enable removal of staged tables when DataCanvas is enabled.", "required": false, "default": "" },
+    "CANVAS_DEFAULT_ROW_LIMIT": { "type": "string", "title": "SQL retained-row ceiling", "description": "Framework default 10000; the server maximum is 25000 rows.", "required": false, "default": "" },
+    "CANVAS_DEFAULT_MEMORY_LIMIT_MB": { "type": "string", "title": "Canvas memory limit (MiB)", "description": "DuckDB memory budget per engine, at most 512 MiB.", "required": false, "default": "" }
+  },
   "mcpServers": {
     "epa-drinking-water-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/epa-drinking-water-mcp-server"],
       "env": {
-        "MCP_TRANSPORT_TYPE": "stdio"
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "CANVAS_PROVIDER_TYPE": "${user_config.CANVAS_PROVIDER_TYPE}",
+        "SDWIS_DATAFRAME_DROP_ENABLED": "${user_config.SDWIS_DATAFRAME_DROP_ENABLED}",
+        "CANVAS_DEFAULT_ROW_LIMIT": "${user_config.CANVAS_DEFAULT_ROW_LIMIT}",
+        "CANVAS_DEFAULT_MEMORY_LIMIT_MB": "${user_config.CANVAS_DEFAULT_MEMORY_LIMIT_MB}"
       }
     }
   }
