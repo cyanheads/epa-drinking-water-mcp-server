@@ -1,6 +1,6 @@
 # epa-drinking-water-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 12:44:10
+Generated on: 2026-10-25 12:52:25
 
 ```text
 epa-drinking-water-mcp-server/
@@ -24,6 +24,7 @@ epa-drinking-water-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
+│   ├── 0.1.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -204,6 +205,7 @@ epa-drinking-water-mcp-server/
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
+├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

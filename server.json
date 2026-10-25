@@ -6,14 +6,14 @@
     "url": "https://github.com/cyanheads/epa-drinking-water-mcp-server",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/epa-drinking-water-mcp-server",
       "runtimeHint": "npx",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "environmentVariables": [
         {
           "name": "CANVAS_PROVIDER_TYPE",
@@ -60,7 +60,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/epa-drinking-water-mcp-server",
       "runtimeHint": "npx",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "environmentVariables": [
         {
           "name": "CANVAS_PROVIDER_TYPE",

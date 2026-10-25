@@ -19,7 +19,7 @@ Use paged DMAP for SDWIS, the national UCMR 5 ZIP for occurrence, and a small bu
 | Package, README tagline, manifest, plugins, Docker and repository description | Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP. |
 | Registry description | Search EPA drinking water systems, violations, enforcement, and contaminant measurements. |
 
-Configure `createApp` identity with `name` and `title`; omit `websiteUrl`. Keep the scaffold at `0.1.0` and `@cyanheads/mcp-ts-core` at `^0.13.16` during implementation. No hosted endpoint or `server.json` remotes are part of this design.
+Configure `createApp` identity with `name` and `title`; omit `websiteUrl`. The framework dependency is `@cyanheads/mcp-ts-core` `^0.13.16`. No hosted endpoint or `server.json` remotes are part of this design.
 
 ## Sources and interpretation
 
