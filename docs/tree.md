@@ -1,6 +1,6 @@
 # epa-drinking-water-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 11:11:08
+Generated on: 2026-10-25 11:54:28
 
 ```text
 epa-drinking-water-mcp-server/
@@ -26,6 +26,7 @@ epa-drinking-water-mcp-server/
 ├── changelog/
 │   └── template.md
 ├── docs/
+│   └── design.md
 ├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
@@ -132,32 +133,64 @@ epa-drinking-water-mcp-server/
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/
+│   ├── config/
+│   │   └── server-config.ts
+│   ├── domain/
+│   │   ├── reference.ts
+│   │   ├── sdwis-contracts.ts
+│   │   ├── source-inputs.ts
+│   │   ├── source-output.ts
+│   │   └── ucmr5-schemas.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
 │   │   │   └── definitions/
-│   │   │       └── echo.prompt.ts
 │   │   ├── resources/
 │   │   │   └── definitions/
-│   │   │       ├── echo-app-ui.app-resource.ts
-│   │   │       └── echo.resource.ts
 │   │   └── tools/
 │   │       └── definitions/
-│   │           ├── echo-app.app-tool.ts
-│   │           └── echo.tool.ts
+│   │           ├── dataframe-describe.tool.ts
+│   │           ├── dataframe-drop.tool.ts
+│   │           ├── dataframe-query.tool.ts
+│   │           ├── get-enforcement-actions.tool.ts
+│   │           ├── get-system-profile.tool.ts
+│   │           ├── get-violations.tool.ts
+│   │           ├── list-reference.tool.ts
+│   │           ├── search-contaminants.tool.ts
+│   │           └── search-water-systems.tool.ts
+│   ├── services/
+│   │   ├── dataframe/
+│   │   │   └── canvas-service.ts
+│   │   ├── sdwis/
+│   │   │   ├── drinking-water-service.ts
+│   │   │   └── sdwis-client.ts
+│   │   └── ucmr5/
+│   │       ├── ucmr5-archive.ts
+│   │       ├── ucmr5-index.ts
+│   │       ├── ucmr5-producer.ts
+│   │       └── ucmr5-service.ts
 │   └── index.ts
 ├── tests/
+│   ├── domain/
+│   │   └── sdwis-contracts.test.ts
 │   ├── fuzz/
-│   │   └── echo-tool.fuzz.test.ts
 │   ├── integration/
-│   │   └── echo-contract.int.test.ts
 │   ├── prompts/
-│   │   └── echo.prompt.test.ts
 │   ├── resources/
-│   │   └── echo.resource.test.ts
+│   ├── services/
+│   │   ├── dataframe/
+│   │   │   ├── canvas-fixtures.ts
+│   │   │   └── canvas-service.test.ts
+│   │   ├── sdwis/
+│   │   │   ├── sdwis-client.test.ts
+│   │   │   └── sdwis-fixtures.ts
+│   │   └── ucmr5/
+│   │       ├── ucmr5-fixtures.ts
+│   │       └── ucmr5-service.test.ts
 │   ├── smoke/
-│   │   └── definitions.smoke.test.ts
 │   └── tools/
-│       └── echo.tool.test.ts
+│       ├── dataframe-tools.test.ts
+│       ├── sdwis-source-tools.test.ts
+│       └── ucmr5-producer.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

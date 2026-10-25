@@ -2,7 +2,7 @@
 
 Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP.
 
-This project is under development. The current scaffold contains echo examples for framework verification; EPA data tools are not implemented yet.
+Provides six EPA data tools and three optional DataCanvas tools for SQL analysis. The project is under development.
 
 Requires Bun ≥1.4.0 or Node.js ≥24.0.0.
 
