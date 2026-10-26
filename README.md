@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/epa-drinking-water-mcp-server</h1>
   <p><b>Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP.</b>
-  <div>6 EPA Tools • 3 Optional DataCanvas Tools</div>
+  <div>9 Tools</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/epa-drinking-water-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/epa-drinking-water-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/epa-drinking-water-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/epa-drinking-water-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/epa-drinking-water-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/epa-drinking-water-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -67,7 +67,8 @@ The dataframe tools require npm or Docker with `CANVAS_PROVIDER_TYPE=duckdb`; dr
 ### `sdwis_get_violations` <sub>tool</sub>
 
 - Require `pwsid` or `state`; optional `county`, `contaminant`, `category`, `health_based`, and `compliance_status`
-- Inclusive `date_from` / `date_to` select compliance-period overlap; unknown dates do not match. Monitoring/reporting violations may lack concentrations
+- Inclusive `date_from` / `date_to` select compliance-period overlap; a known endpoint can prove overlap despite a missing endpoint. Indeterminate periods are excluded with a count of affected rows examined during the call. Monitoring/reporting violations may lack concentrations
+- `contaminant:lead` selects `1030` and Lead and Copper Rule code `5000`, including copper and monitoring records; either exact code selects only itself
 - `stage:true` requests a partition; `stage_max_rows` defaults to 5,000 and clamps at 25,000. Supply a held `canvas_id` to add another partition
 
 ---
@@ -76,7 +77,7 @@ The dataframe tools require npm or Docker with `CANVAS_PROVIDER_TYPE=duckdb`; dr
 
 - Require `dataset` (`violations`, `lcr`, or `ucmr5`) and `pwsid` or `state`; optional county, contaminant, and inclusive dates select compliance periods, LCR sample periods, or UCMR collection dates respectively
 - LCR lead/copper select PB90/CU90 summaries, not household samples. UCMR `PFAS` covers 29 analytes; lithium is separate. `zip` and `detected_only` are UCMR-only; service ZIP is not sample location, and censored values remain unknown below reporting limits
-- Supports `stage`, `canvas_id`, and `stage_max_rows` (5,000 default, 25,000 maximum). Cold UCMR calls may need a 180-second client timeout; narrow broad requests to a PWSID or county when membership resolution times out
+- Supports `stage`, `canvas_id`, and `stage_max_rows` (5,000 default, 25,000 maximum). Cold UCMR calls may need a 180-second client timeout; broad `state`/`county` scopes resolve reported-state membership through resumable pages before returning occurrence rows
 
 ---
 
@@ -91,7 +92,9 @@ The dataframe tools require npm or Docker with `CANVAS_PROVIDER_TYPE=duckdb`; dr
 ### `sdwis_dataframe_describe` <sub>tool</sub>
 
 - Required caller-held `canvas_id`; optional exact `table_name`; `limit` defaults to 10 and clamps at 100 with `cursor` pagination
-- One table-column entry per item includes types, row counts, expiry, filters, provenance, completeness, and continuation. There is no global canvas listing
+- One whole table per item includes its `columns` array, row count, expiry, filters, provenance, completeness, and continuation; counts and limits are in tables. There is no global canvas listing
+- Oversized table metadata returns `record_cursor` for lossless `view:text` chunks. Describe continuations expire after 15 minutes or table expiry, and reject changed metadata
+- `selection_coverage` reports which source partitions and required companion relations remain staged, separately from SQL results
 
 ---
 
@@ -100,6 +103,7 @@ The dataframe tools require npm or Docker with `CANVAS_PROVIDER_TYPE=duckdb`; dr
 - Required `canvas_id` and one read-only SELECT, WITH, or FROM statement in `sql` (at most 20,000 characters); describe the canvas first
 - Retains at most `CANVAS_DEFAULT_ROW_LIMIT` (framework default 10,000), bounded by 25,000. `row_count`, `truncated`, and `has_more` distinguish retained rows from omitted rows; continuations read an immutable result for up to 15 minutes
 - File, network, write, and system-catalog access are refused. `source_complete` conservatively includes every live source partition, including tables the SQL does not reference
+- `selection_coverage.chain_complete` confirms the canvas holds a complete source retrieval chain; it does not establish which tables the SQL uses or override `truncated`. Query continuations retain the original coverage snapshot
 
 ---
 
@@ -114,35 +118,28 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 
 EPA-specific:
 
-- Contact-free inventory and service membership, with source codes retained when labels are unavailable
-- Historical quarterly SDWIS records, LCR summaries, and limited-participation UCMR 5 monitoring kept distinct; empty results establish neither current compliance nor tap-water safety or contaminant absence
-- Source dates retain calendar meaning; non-midnight source timestamps retain a `_raw` field
-- Lazy process-local UCMR acquisition; statewide requests can exceed the 45-second membership budget even after archive acquisition. Narrow by PWSID/county rather than treating the server as a complete national warehouse
+- Keyless SDWIS reads over EPA DMAP, paced at one request per second, with every returned row rechecked against the requested predicates
+- Contact-free inventory and service membership; source codes kept alongside EPA dictionary labels, which stay null when EPA has none
+- Quarterly SDWIS records, LCR summaries, and limited-participation UCMR 5 monitoring kept distinct; empty results establish neither current compliance, tap-water safety, nor contaminant absence
+- UCMR 5 archive downloaded and indexed once per published revision on first use; censored results keep a null value with the reporting limit
 
 Agent-friendly output:
 
-- Provenance — `effective_filters`, source URL, `retrieved_at`, publication/HTTP validators when available, and interpretation caveats
-- Completeness — `source_complete:false` can remain false with `has_more:false` after earlier rows were delivered in other pages or partitions; aggregation does not restore completeness
-- Whole-record paging — `limit` defaults to 10 and clamps at 100; byte limits can return fewer rows. Follow `next_cursor` with unchanged selectors, including empty `phase:membership` pages; source cursors expire after 15 minutes of inactivity
-- Oversized records — `item_too_large` supplies `record_cursor`; use `view:text` and concatenate JSON chunks, then follow the records continuation. Both MCP content surfaces carry the same values
+- Provenance — `effective_filters`, source URL, `retrieved_at`, publication/HTTP validators when available, and interpretation caveats; source dates keep their calendar day, with non-midnight timestamps in a `_raw` field
+- Completeness — `source_complete:false` can stay false with `has_more:false` once earlier rows went to other pages or partitions; aggregation does not restore it
+- Source coverage — `selection_partition` identifies a retrieval and its delivered partition; canvas `selection_coverage` distinguishes a fully staged chain from missing, dropped, or expired partitions and companions
+- Whole-record paging — `limit` defaults to 10 and clamps at 100; the ~23 KB response budget can return fewer rows. Follow `next_cursor` with unchanged selectors, including empty `phase:membership` pages; cursors expire after 15 idle minutes
+- Oversized records — `item_too_large` supplies `record_cursor` for `view:text` JSON chunks. `content[]` and `structuredContent` carry the same values
 
 ## Getting started
 
-Add one of these configurations to your MCP client. No EPA account or API key is required.
+No EPA account or API key is required. Add the server to Claude Code:
 
-```json
-{
-  "mcpServers": {
-    "epa-drinking-water-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/epa-drinking-water-mcp-server@latest"]
-    }
-  }
-}
+```sh
+claude mcp add epa-drinking-water-mcp-server -- npx -y @cyanheads/epa-drinking-water-mcp-server
 ```
 
-Or with npx (no Bun required):
+For other MCP clients, add this stdio configuration:
 
 ```json
 {
@@ -150,52 +147,54 @@ Or with npx (no Bun required):
     "epa-drinking-water-mcp-server": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/epa-drinking-water-mcp-server@latest"]
+      "args": ["-y", "@cyanheads/epa-drinking-water-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
     }
   }
 }
 ```
 
-Or with Docker:
+For SQL staging, add `"CANVAS_PROVIDER_TYPE": "duckdb"` to `env` (Docker: `-e CANVAS_PROVIDER_TYPE=duckdb`), call a source tool with `stage:true`, and pass the returned `dataset.canvas_id` to `sdwis_dataframe_describe` and `sdwis_dataframe_query`. The Claude Desktop bundle fixes `CANVAS_PROVIDER_TYPE=none`; staging there returns `canvas_disabled`.
 
-```json
-{
-  "mcpServers": {
-    "epa-drinking-water-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "ghcr.io/cyanheads/epa-drinking-water-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-For SQL staging, set `CANVAS_PROVIDER_TYPE=duckdb` in the npm process environment (Docker: `-e CANVAS_PROVIDER_TYPE=duckdb`). Call a source tool with `stage:true`, retain `dataset.canvas_id`, then call `sdwis_dataframe_describe` before querying. Retain every source-partition continuation. The Claude Desktop bundle fixes `CANVAS_PROVIDER_TYPE=none`; staging there returns `canvas_disabled`.
-
-For Streamable HTTP from a local checkout:
+For Streamable HTTP, set the transport and start the server:
 
 ```sh
 MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# http://localhost:3010/mcp
+# Server listens at http://localhost:3010/mcp
 ```
 
 ### Prerequisites
 
-- [Bun ≥1.4.0](https://bun.sh/) or Node.js ≥24.0.0
-- Network access to EPA services; allow a 180-second client timeout for cold UCMR calls
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- Network access to `data.epa.gov` and `www.epa.gov`; allow a 180-second client timeout for the first UCMR call, which downloads and indexes the archive.
 
 ### Installation
 
+1. **Clone the repository:**
+
 ```sh
 git clone https://github.com/cyanheads/epa-drinking-water-mcp-server.git
+```
+
+2. **Navigate into the directory:**
+
+```sh
 cd epa-drinking-water-mcp-server
+```
+
+3. **Install dependencies:**
+
+```sh
 bun install
+```
+
+4. **Configure environment (optional):**
+
+```sh
 cp .env.example .env
-bun run rebuild
+# set CANVAS_PROVIDER_TYPE=duckdb to enable SQL staging
 ```
 
 ## Configuration
@@ -252,17 +251,22 @@ The image defaults to Streamable HTTP on port 3010 with stateless sessions. Add 
 
 ## Development guide
 
-See [`CLAUDE.md`](./CLAUDE.md) and [`AGENTS.md`](./AGENTS.md).
+See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rules. The short version:
 
-- Handlers throw typed failures; the framework renders errors
-- Register directly in `src/index.ts`; validate upstream data before normalization
-- Preserve uncertainty, provenance, dates, and completeness; never infer compliance, household exposure, or exceedances
-- Keep `content[]` and `structuredContent` equivalent; never write source results to user storage
+- Handlers throw, framework catches — no `try/catch` in tool logic
+- Use `ctx.log` for logging; source results never go to `ctx.state` or user storage
+- Register new tools in the `createApp()` array in `src/index.ts`
+- Wrap external API calls: validate raw → normalize to domain type → return output schema; never fabricate missing fields, and never infer compliance, household exposure, or exceedances
 
 ## Contributing
 
-Issues are welcome. Run `bun run devcheck` and `bun run test` before submitting.
+Issues are welcome. Run checks and tests before submitting:
+
+```sh
+bun run devcheck
+bun run test
+```
 
 ## License
 
-[Apache-2.0](./LICENSE).
+This project is licensed under the Apache 2.0 License. See the [LICENSE](./LICENSE) file for details.

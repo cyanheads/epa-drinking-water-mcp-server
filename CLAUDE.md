@@ -2,7 +2,7 @@
 
 **Server:** epa-drinking-water-mcp-server
 **Version:** 0.1.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.16`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 
 Read `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` for framework APIs. Read `docs/design.md` before changing source contracts. Run `bun run list-skills` and read the matching `framework-skills/<skill>/SKILL.md` before task work.
@@ -62,23 +62,25 @@ return produceSource(
 ## Source and output contracts
 
 - State means reported legal-entity state, county means served membership, and UCMR service ZIP is not sample location.
-- Violations use compliance-period overlap; LCR uses sample-period overlap; enforcement uses enforcement date; UCMR uses collection date. Unknown dates never satisfy date filters.
+- Violations use compliance-period overlap; LCR uses sample-period overlap; enforcement uses enforcement date; UCMR uses collection date. Known endpoints can prove interval overlap; indeterminate overlap is excluded without inferring missing endpoints.
 - `limit` defaults to 10 and clamps at 100. Source `stage_max_rows` defaults to 5000 and clamps at 25000.
 - Follow exact continuations with unchanged selectors, including membership pages with no items. `source_complete` remains conservative after earlier pages; `has_more:false` does not imply the current output contains the entire selection.
 - A too-large whole row fails `item_too_large` with `record_cursor`; text view returns lossless JSON chunks.
-- Source calls share a 45-second work budget. Cold UCMR acquisition may need a 180-second client timeout; broad membership can still time out and should be narrowed.
+- Source calls share a 45-second work budget; membership scans checkpoint before the deadline and resume at the last committed page. Cold UCMR acquisition may need a 180-second client timeout.
 
 ## DataCanvas and packaging
 
 `CANVAS_PROVIDER_TYPE=none` is the default. npm/Docker can enable `duckdb`. SQL retention honors `CANVAS_DEFAULT_ROW_LIMIT` (framework default 10000) up to the server maximum 25000. Per-engine `CANVAS_DEFAULT_MEMORY_LIMIT_MB` defaults to 512 and may not exceed 512.
 
-Staging is explicit (`stage:true`), bounded, and capability-scoped. Query completeness conservatively inherits every live partition. SQL uses framework read-only/file/network/system-catalog gates; do not add a parallel SQL parser. Query continuations read immutable retained results.
+Staging is explicit (`stage:true`), bounded, and capability-scoped. Query completeness conservatively inherits every live partition. `selection_coverage` separately reports complete source chains and required companions; it never claims SQL lineage. SQL uses framework read-only/file/network/system-catalog gates; do not add a parallel SQL parser. Query continuations read immutable retained results and coverage snapshots.
 
 `SDWIS_DATAFRAME_DROP_ENABLED=true` additionally enables table removal. Missing tables and expired canvases return `dropped:false`.
 
 MCPB strips native bindings and explicitly fixes `CANVAS_PROVIDER_TYPE=none`, with no SQL toggle. Keep all six EPA tools usable without native modules; staging fails `canvas_disabled`. npm plugin options must reach the server through Codex `env_vars` or Claude `userConfig` substitutions.
 
 Keep package, registry, MCPB, plugin, Docker, and README identities synchronized. The package description is canonical; registry description is a condensed maximum of 100 characters. Exclude `docs/idea.md` from git, npm, Docker, and MCPB.
+
+Root `plugin.json` and `mcp.json` follow Agent Plugins 1.0.0. Root MCP configuration holds only fixed environment values; keep the Codex overlay pointer and its `env_vars` for user configuration. Root `skills/` is an opt-in published skill tree, distinct from the development-only `framework-skills/`; use `framework-skills/add-skill/SKILL.md` only when publishing a skill earns its place.
 
 ## Commands and verification
 

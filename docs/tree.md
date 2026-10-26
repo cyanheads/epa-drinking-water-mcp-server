@@ -1,6 +1,6 @@
 # epa-drinking-water-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 12:52:25
+Generated on: 2026-10-26 03:58:24
 
 ```text
 epa-drinking-water-mcp-server/
@@ -36,6 +36,8 @@ epa-drinking-water-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -172,12 +174,15 @@ epa-drinking-water-mcp-server/
 │   └── index.ts
 ├── tests/
 │   ├── domain/
-│   │   └── sdwis-contracts.test.ts
+│   │   ├── sdwis-contracts.test.ts
+│   │   └── source-inputs.test.ts
 │   ├── fuzz/
 │   ├── integration/
 │   │   └── canvas-runtime.test.ts
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   └── bundle-entries.test.ts
 │   ├── services/
 │   │   ├── dataframe/
 │   │   │   ├── canvas-fixtures.ts
@@ -192,6 +197,7 @@ epa-drinking-water-mcp-server/
 │   ├── smoke/
 │   └── tools/
 │       ├── dataframe-tools.test.ts
+│       ├── error-contracts.test.ts
 │       ├── sdwis-source-dates.test.ts
 │       ├── sdwis-source-tools.test.ts
 │       ├── source-markdown.test.ts
@@ -211,7 +217,9 @@ epa-drinking-water-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
