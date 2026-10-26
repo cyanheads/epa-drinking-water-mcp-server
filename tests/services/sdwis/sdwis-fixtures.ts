@@ -28,7 +28,7 @@ export function renderedText(text: string): string {
 /** One expected request, including its full production URL path. */
 export interface Exchange {
   path: string | RegExp;
-  response?: () => Response | Promise<Response>;
+  response?: (signal: AbortSignal) => Response | Promise<Response>;
   rows?: unknown;
 }
 /** Install a sequential network boundary; unexpected fetches always fail final verification. */
@@ -52,7 +52,14 @@ export function network(exchanges: Exchange[]) {
       failures.push(`Unexpected DMAP request: ${url.href}`);
       return new Response(null, { status: 403 });
     }
-    return expected.response ? expected.response() : Response.json(expected.rows ?? []);
+    try {
+      return expected.response
+        ? await expected.response(init.signal)
+        : Response.json(expected.rows ?? []);
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AssertionError') failures.push(error.message);
+      throw error;
+    }
   });
   return {
     calls,

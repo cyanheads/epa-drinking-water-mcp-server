@@ -37,6 +37,15 @@ export const listReferenceTool = tool('sdwis_list_reference', {
   output: z.object(sourceOutputShape),
   errors: [
     {
+      reason: 'selection_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Live selections or retained source data reached the process capacity.',
+      recovery:
+        'Wait fifteen minutes for source selections to expire, then retry with narrower selectors.',
+    },
+    {
       reason: 'cursor_invalid',
       code: JsonRpcErrorCode.ValidationError,
       thrownBy: 'service',
@@ -79,5 +88,5 @@ export const listReferenceTool = tool('sdwis_list_reference', {
       type ? undefined : bundledReference(input.topic),
     );
   },
-  format: (result) => formatSource(result),
+  format: formatSource,
 });

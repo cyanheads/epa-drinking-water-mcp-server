@@ -29,19 +29,32 @@ export const searchWaterSystemsTool = tool('sdwis_search_water_systems', {
       .nonnegative()
       .optional()
       .describe('Inclusive maximum reported population; unknown populations do not match.'),
-    source: optionalText('Exact primary-source code from sdwis_list_reference.'),
+    source: optionalText('Exact PRIMARY_SOURCE_CODE: GW, GWP, SW, SWP, GU or GUP.'),
     system_type: optionalText('Exact system type such as CWS, NTNCWS or TNCWS.'),
     activity: z
       .enum(['active', 'inactive', 'all'])
       .default('active')
-      .describe('Inventory activity filter; active by default, explicitly echoed.'),
+      .describe(
+        'Inventory activity: active selects A, inactive selects I (excluding N, changed to non-public), and all applies no activity predicate.',
+      ),
     primacy_agency: optionalText(
       'Exact primacy-agency jurisdiction code; not a physical state selector.',
     ),
-    pwsid_prefix: optionalText('Alphanumeric jurisdiction prefix; not a physical state selector.'),
+    pwsid_prefix: optionalText(
+      'One to nine alphanumeric jurisdiction characters; not a physical state selector.',
+    ).meta({ pattern: '^\\s*(?:[A-Za-z0-9]{1,9}\\s*)?(?![\\s\\S])' }),
   }),
   output: z.object(sourceOutputShape),
   errors: [
+    {
+      reason: 'selection_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Live selections or retained source data reached the process capacity.',
+      recovery:
+        'Wait fifteen minutes for source selections to expire, then retry with narrower selectors.',
+    },
     {
       reason: 'invalid_selector',
       code: JsonRpcErrorCode.ValidationError,
@@ -111,5 +124,5 @@ export const searchWaterSystemsTool = tool('sdwis_search_water_systems', {
       );
     return produceSource('sdwis_search_water_systems', 'water_system', input, ctx);
   },
-  format: (result) => formatSource(result),
+  format: formatSource,
 });

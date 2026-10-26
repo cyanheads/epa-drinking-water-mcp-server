@@ -5,6 +5,20 @@
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
 import type { PublicRow } from './sdwis-contracts.js';
 
+const contaminantAliases = {
+  lcr: new Map([
+    ['LEAD', 'PB90'],
+    ['COPPER', 'CU90'],
+    ['PB90', 'PB90'],
+    ['CU90', 'CU90'],
+  ]),
+  violations: new Map([
+    ['LEAD', '1030,5000'],
+    ['ARSENIC', '1005'],
+    ['NITRATE', '1040'],
+    ['TTHM', '2950'],
+  ]),
+};
 /** Exact SDWIS aliases; LCR summary namespaces are deliberately separate. */
 export function resolveContaminant(
   value: string | undefined,
@@ -12,21 +26,7 @@ export function resolveContaminant(
 ): string | undefined {
   if (!value) return undefined;
   const normalized = value.trim().toUpperCase();
-  const aliases =
-    mode === 'lcr'
-      ? new Map([
-          ['LEAD', 'PB90'],
-          ['COPPER', 'CU90'],
-          ['PB90', 'PB90'],
-          ['CU90', 'CU90'],
-        ])
-      : new Map([
-          ['LEAD', '1030'],
-          ['ARSENIC', '1005'],
-          ['NITRATE', '1040'],
-          ['TTHM', '2950'],
-        ]);
-  const resolved = aliases.get(normalized);
+  const resolved = contaminantAliases[mode].get(normalized);
   if (resolved) return resolved;
   if (mode === 'violations' && /^[A-Z0-9]{4}$/.test(normalized)) return normalized;
   throw validationError(

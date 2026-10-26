@@ -13,7 +13,7 @@ import { produceSource } from '@/services/sdwis/drinking-water-service.js';
 /** Retrieve the selected published violation rows or stage a bounded partition. */
 export const getViolationsTool = tool('sdwis_get_violations', {
   description:
-    'Retrieve reported historical SDWA violations for a PWSID or reported legal-entity state, optionally narrowed by county, contaminant, category or compliance flags. Dates mean inclusive compliance-period overlap, not sampling dates; unknown dates do not match date filters. Monitoring/reporting violations may have no measured concentration. Missing records do not establish current compliance or water safety. Set stage true to acquire a bounded analytical partition, retaining every continuation before drawing complete conclusions.',
+    'Retrieve reported historical SDWA violations for a PWSID or reported legal-entity state, optionally narrowed by county, contaminant, category or compliance flags. Dates mean inclusive compliance-period overlap, not sampling dates; either known endpoint can establish overlap, while indeterminate overlap is excluded and reported. Monitoring/reporting violations may have no measured concentration. Missing records do not establish current compliance or water safety. Set stage true to acquire a bounded analytical partition, retaining every continuation before drawing complete conclusions.',
   annotations: {
     readOnlyHint: false,
     destructiveHint: false,
@@ -25,7 +25,7 @@ export const getViolationsTool = tool('sdwis_get_violations', {
     ...dateFields,
     ...pagingFields,
     contaminant: optionalText(
-      'Exact SDWIS contaminant code or lead, arsenic, nitrate, TTHM; not a UCMR family selector.',
+      'Exact SDWIS contaminant code or lead, arsenic, nitrate, TTHM; lead selects 1030 and Lead and Copper Rule code 5000, including copper/monitoring records; not a UCMR family selector.',
     ),
     category: optionalText(
       'Exact violation-category code; preserves monitoring/reporting distinctions.',
@@ -55,6 +55,24 @@ export const getViolationsTool = tool('sdwis_get_violations', {
   }),
   output: z.object(sourceOutputShape),
   errors: [
+    {
+      reason: 'selection_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Live selections or retained source data reached the process capacity.',
+      recovery:
+        'Wait fifteen minutes for source selections to expire, then retry with narrower selectors.',
+    },
+    {
+      reason: 'canvas_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Canvas admission, operation queue, table or row capacity is full.',
+      recovery:
+        'Reuse a canvas_id you already hold, wait for expiry, or narrow the source selection.',
+    },
     {
       reason: 'invalid_selector',
       code: JsonRpcErrorCode.ValidationError,
@@ -129,5 +147,5 @@ export const getViolationsTool = tool('sdwis_get_violations', {
       ctx,
     );
   },
-  format: (result) => formatSource(result),
+  format: formatSource,
 });

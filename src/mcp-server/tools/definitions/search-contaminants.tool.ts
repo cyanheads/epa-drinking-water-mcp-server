@@ -29,9 +29,11 @@ export const searchContaminantsTool = tool('sdwis_search_contaminants', {
     ...geographyFields,
     ...dateFields,
     ...pagingFields,
-    zip: optionalText('Five-digit UCMR service-membership ZIP, not sample location; UCMR only.'),
+    zip: optionalText(
+      'Five-digit UCMR service-membership ZIP, not sample location; UCMR only.',
+    ).meta({ pattern: '^\\s*(?:[0-9]{5}\\s*)?(?![\\s\\S])' }),
     contaminant: optionalText(
-      'Exact dataset-specific code/analyte or known alias; PFAS is a UCMR family selector.',
+      'Exact dataset-specific code/analyte or known alias; violations lead selects 1030 and Lead and Copper Rule code 5000, including copper/monitoring records; PFAS is a UCMR family selector.',
     ),
     detected_only: z
       .boolean()
@@ -57,6 +59,24 @@ export const searchContaminantsTool = tool('sdwis_search_contaminants', {
   }),
   output: z.object(sourceOutputShape),
   errors: [
+    {
+      reason: 'selection_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Live selections or retained source data reached the process capacity.',
+      recovery:
+        'Wait fifteen minutes for source selections to expire, then retry with narrower selectors.',
+    },
+    {
+      reason: 'canvas_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Canvas admission, operation queue, table or row capacity is full.',
+      recovery:
+        'Reuse a canvas_id you already hold, wait for expiry, or narrow the source selection.',
+    },
     {
       reason: 'invalid_selector',
       code: JsonRpcErrorCode.ValidationError,
@@ -155,5 +175,5 @@ export const searchContaminantsTool = tool('sdwis_search_contaminants', {
       ctx,
     );
   },
-  format: (result) => formatSource(result),
+  format: formatSource,
 });

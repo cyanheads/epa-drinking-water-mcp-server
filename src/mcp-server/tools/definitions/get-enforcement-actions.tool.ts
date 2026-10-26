@@ -5,7 +5,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { dateFields, optionalText, pagingFields } from '@/domain/source-inputs.js';
+import { dateFields, optionalText, pagingFields, requiredPwsid } from '@/domain/source-inputs.js';
 import { formatSource, sourceOutputShape } from '@/domain/source-output.js';
 import { produceSource } from '@/services/sdwis/drinking-water-service.js';
 
@@ -20,11 +20,9 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
     openWorldHint: true,
   },
   input: z.object({
-    pwsid: z
-      .string()
-      .describe(
-        'Exact nine-character alphanumeric PWSID from sdwis_search_water_systems; unknown but shaped IDs return no matches.',
-      ),
+    pwsid: requiredPwsid.describe(
+      'Exact nine-character alphanumeric PWSID from sdwis_search_water_systems; unknown but shaped IDs return no matches.',
+    ),
     section: z
       .enum(['actions', 'associations'])
       .default('actions')
@@ -54,6 +52,24 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
   }),
   output: z.object(sourceOutputShape),
   errors: [
+    {
+      reason: 'selection_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Live selections or retained source data reached the process capacity.',
+      recovery:
+        'Wait fifteen minutes for source selections to expire, then retry with narrower selectors.',
+    },
+    {
+      reason: 'canvas_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Canvas admission, operation queue, table or row capacity is full.',
+      recovery:
+        'Reuse a canvas_id you already hold, wait for expiry, or narrow the source selection.',
+    },
     {
       reason: 'invalid_selector',
       code: JsonRpcErrorCode.ValidationError,
@@ -126,5 +142,5 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
       ctx,
     );
   },
-  format: (result) => formatSource(result),
+  format: formatSource,
 });

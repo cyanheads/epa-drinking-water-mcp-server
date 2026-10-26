@@ -1,8 +1,12 @@
-/** @fileoverview Read-only SQL over an explicitly held public-data canvas. */
+/**
+ * @fileoverview Read-only SQL over an explicitly held public-data canvas.
+ * @module mcp-server/tools/definitions/dataframe-query
+ */
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { optionalText, pagingFields } from '@/domain/source-inputs.js';
-import { formatSource } from '@/domain/source-output.js';
+import { formatSource, selectionCoverageSchema } from '@/domain/source-output.js';
 import { getCanvasService } from '@/services/dataframe/canvas-service.js';
 
 /** Query pagination reads an immutable bounded result, never reruns SQL for a cursor. */
@@ -20,6 +24,7 @@ export const dataframeQueryTool = tool('sdwis_dataframe_query', {
     ...pagingFields,
   }),
   output: z.object({
+    selection_coverage: selectionCoverageSchema,
     canvas_id: z.string().describe('Explicit canvas capability.'),
     pointer: z.string().describe('Executable describe/query next steps.'),
     columns: z.array(z.string()).describe('SQL projection names.'),
@@ -55,6 +60,26 @@ export const dataframeQueryTool = tool('sdwis_dataframe_query', {
       .optional()
       .describe('Use next_cursor as cursor or record_cursor according to this phase.'),
   }),
+  errors: [
+    {
+      reason: 'canvas_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Canvas admission, operation queue, table or row capacity is full.',
+      recovery:
+        'Reuse a canvas_id you already hold, wait for expiry, or narrow the source selection.',
+    },
+    {
+      reason: 'query_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'Immutable query results reached the retained entry or byte capacity.',
+      recovery:
+        'Wait fifteen minutes for retained queries to expire, then retry sdwis_dataframe_query with narrower SQL.',
+    },
+  ],
   handler: (input, ctx) => getCanvasService().query(input, ctx),
   format: formatSource,
 });

@@ -87,24 +87,17 @@ await createApp({
     );
     setUcmrReferenceProvider(() => catalog);
     if (!core.canvas) {
+      const canvasDisabled = {
+        reason:
+          'DataCanvas is disabled in this runtime. MCPB supports the six EPA reading tools only.',
+        hint: 'Use npm or Docker with CANVAS_PROVIDER_TYPE=duckdb.',
+      };
       tools.splice(
         6,
         3,
-        disabledTool(dataframeDescribeTool, {
-          reason:
-            'DataCanvas is disabled in this runtime. MCPB supports the six EPA reading tools only.',
-          hint: 'Use npm or Docker with CANVAS_PROVIDER_TYPE=duckdb.',
-        }),
-        disabledTool(dataframeQueryTool, {
-          reason:
-            'DataCanvas is disabled in this runtime. MCPB supports the six EPA reading tools only.',
-          hint: 'Use npm or Docker with CANVAS_PROVIDER_TYPE=duckdb.',
-        }),
-        disabledTool(dataframeDropTool, {
-          reason:
-            'DataCanvas is disabled in this runtime. MCPB supports the six EPA reading tools only.',
-          hint: 'Use npm or Docker with CANVAS_PROVIDER_TYPE=duckdb.',
-        }),
+        disabledTool(dataframeDescribeTool, canvasDisabled),
+        disabledTool(dataframeQueryTool, canvasDisabled),
+        disabledTool(dataframeDropTool, canvasDisabled),
       );
     } else if (!config.dataframeDropEnabled)
       tools.splice(

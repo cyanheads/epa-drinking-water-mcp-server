@@ -12,16 +12,18 @@ export function fixture() {
     defaultRowLimit: 25000,
     schemaSniffRows: 100,
   });
-  const canvas = new DataCanvas(
+  const registry = new CanvasRegistry(
     provider,
-    new CanvasRegistry(provider, {
+    {
       ttlMs: 3600000,
       absoluteCapMs: 7200000,
       maxCanvasesPerTenant: 100,
       sweeperIntervalMs: 0,
-    }),
+    },
+    () => Date.now(),
   );
-  return { canvas, service: new CanvasService(canvas, 25000), ctx: createMockContext() };
+  const canvas = new DataCanvas(provider, registry);
+  return { canvas, registry, service: new CanvasService(canvas, 25000), ctx: createMockContext() };
 }
 /** Source lineage intentionally remains partial after any SQL aggregation. */
 export function output(complete = false): SourceOutput {

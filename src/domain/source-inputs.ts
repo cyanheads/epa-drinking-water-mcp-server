@@ -6,6 +6,18 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
 import { calendarDate } from './sdwis-contracts.js';
 
+/** Unicode uppercasing can expand raw characters into ASCII; normalized length remains runtime-validated. */
+const rawPwsid =
+  '(?:[A-Za-z0-9]{9}|(?=[A-Za-z0-9]{0,8}[^\\x00-\\x7f])(?:(?!\\s)[A-Za-z0-9\\u0080-\\uffff]){1,9})';
+/** Raw formats advertise existing normalization; semantic errors remain invalid_selector. */
+const optionalPwsidPattern = `^\\s*(?:${rawPwsid}\\s*)?(?![\\s\\S])`;
+const datePattern =
+  '^\\s*(?:[0-9]{4}-[0-9]{2}-[0-9]{2}(?: [0-9]{2}:[0-9]{2}:[0-9]{2})?\\s*)?(?![\\s\\S])';
+/** Required IDs reject control characters before trimming, unlike optional selectors. */
+export const requiredPwsid = z.string().meta({
+  pattern: `^[^\\S\\x00-\\x1f\\x7f]*${rawPwsid}[^\\S\\x00-\\x1f\\x7f]*(?![\\s\\S])`,
+});
+
 /** Optional strings treat blank client-form values as unset. */
 export function optionalText(description: string) {
   return z
@@ -40,7 +52,7 @@ export const pagingFields = {
 export const geographyFields = {
   pwsid: optionalText(
     'Exact nine-character alphanumeric PWSID from sdwis_search_water_systems; numeric tribal prefixes and alphabetic suffixes are valid.',
-  ),
+  ).meta({ pattern: optionalPwsidPattern }),
   state: optionalText(
     'Reported WATER_SYSTEM legal-entity postal state or territory name/code; not a physical service boundary.',
   ),
@@ -51,11 +63,11 @@ export const geographyFields = {
 /** Analytical interval selectors use inclusive source calendar-date overlap. */
 export const dateFields = {
   date_from: optionalText(
-    'Inclusive YYYY-MM-DD lower date; violations use compliance-period overlap, LCR sample-period overlap, actions enforcement date and UCMR collection date.',
-  ),
+    'Inclusive YYYY-MM-DD or YYYY-MM-DD HH:mm:ss lower date, normalized to its calendar day; violations/LCR require known endpoints to establish period overlap, actions use enforcement date and UCMR collection date.',
+  ).meta({ pattern: datePattern }),
   date_to: optionalText(
-    'Inclusive YYYY-MM-DD upper date; unknown source dates do not match a requested date interval.',
-  ),
+    'Inclusive YYYY-MM-DD or YYYY-MM-DD HH:mm:ss upper date, normalized to its calendar day; either known period endpoint can establish overlap, while indeterminate overlap is excluded and reported.',
+  ).meta({ pattern: datePattern }),
 };
 const stateNames =
   'Alabama:AL|Alaska:AK|Arizona:AZ|Arkansas:AR|California:CA|Colorado:CO|Connecticut:CT|Delaware:DE|District of Columbia:DC|Florida:FL|Georgia:GA|Hawaii:HI|Idaho:ID|Illinois:IL|Indiana:IN|Iowa:IA|Kansas:KS|Kentucky:KY|Louisiana:LA|Maine:ME|Maryland:MD|Massachusetts:MA|Michigan:MI|Minnesota:MN|Mississippi:MS|Missouri:MO|Montana:MT|Nebraska:NE|Nevada:NV|New Hampshire:NH|New Jersey:NJ|New Mexico:NM|New York:NY|North Carolina:NC|North Dakota:ND|Ohio:OH|Oklahoma:OK|Oregon:OR|Pennsylvania:PA|Rhode Island:RI|South Carolina:SC|South Dakota:SD|Tennessee:TN|Texas:TX|Utah:UT|Vermont:VT|Virginia:VA|Washington:WA|West Virginia:WV|Wisconsin:WI|Wyoming:WY|American Samoa:AS|Guam:GU|Northern Mariana Islands:MP|Puerto Rico:PR|Virgin Islands:VI|United States Virgin Islands:VI|Federated States of Micronesia:FM|Marshall Islands:MH|Palau:PW';
@@ -68,22 +80,33 @@ for (const entry of stateNames.split('|')) {
   }
 }
 /** Normalize a complete state/territory name or postal abbreviation. */
-export function normalizeState(value: string): string {
+function normalizeState(value: string): string {
   const state = states.get(value.trim().toUpperCase());
   if (!state) throw validationError('Unknown state or territory.', { reason: 'invalid_selector' });
   return state;
+}
+/** True when a value could escape its single DMAP path segment: path syntax or control characters. */
+export function hasUnsafeSegment(value: string): boolean {
+  return (
+    /[/\\?#%]/.test(value) ||
+    Array.from(value).some(
+      (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+    )
+  );
+}
+/** The selection a continuation binds: every input except paging, view and capability fields. */
+export function selectionFilters(input: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...input };
+  for (const name of ['cursor', 'record_cursor', 'view', 'limit', 'stage_max_rows', 'canvas_id'])
+    delete result[name];
+  return result;
 }
 /** Normalize selector strings without accepting path syntax or control characters. */
 export function normalizeSelectors(input: Record<string, unknown>): Record<string, unknown> {
   const result = { ...input };
   for (const [key, value] of Object.entries(result))
     if (typeof value === 'string') {
-      if (
-        /[/\\?#%]/.test(value) ||
-        Array.from(value).some(
-          (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
-        )
-      )
+      if (hasUnsafeSegment(value))
         throw validationError('Selector contains path or control characters.', {
           reason: 'invalid_selector',
         });

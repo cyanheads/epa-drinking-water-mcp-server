@@ -32,6 +32,18 @@ function read(caller = signal()) {
 }
 
 describe('DMAP network boundary', () => {
+  it('accepts a fully read empty JSON array as an exhausted page on the first attempt', async () => {
+    http = network([{ path, response: () => new Response('[]') }]);
+    expect((await paced(read())).rows).toEqual([]);
+    expect(http.calls).toHaveLength(1);
+  });
+  it('rejects a fully read empty HTTP 200 body without retry', async () => {
+    http = network([{ path, response: () => new Response('') }]);
+    await expect(paced(read())).rejects.toMatchObject({
+      data: { reason: 'upstream_contract_changed' },
+    });
+    expect(http.calls).toHaveLength(1);
+  });
   it('uses explicit directions for EPA composite ordering before the inclusive range', async () => {
     const expectedPath =
       '/dmapservice/sdwis.violation/pwsid/equals/WA1234567/sort/pwsid:asc,violation_id:asc/1:2/json';

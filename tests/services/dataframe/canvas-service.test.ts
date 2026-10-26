@@ -32,6 +32,249 @@ function query(canvas_id: string, sql: string, more = {}) {
 }
 
 describe('real canvas service', () => {
+  it('marks coverage incomplete when an earlier partition expires before the final partition', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const now = Date.now();
+    const source = (partition: number, final_partition: number | null) => ({
+      ...output(),
+      selection_partition: { selection_id: 'expiring', partition, final_partition },
+    });
+    const first = await f.service.stageRelations({}, source(0, null), [relation], f.ctx);
+    vi.setSystemTime(now + 600000);
+    await f.service.stageRelations({ canvas_id: first.canvas_id }, source(1, 1), [relation], f.ctx);
+    vi.setSystemTime(now + 3600001);
+    await f.registry.sweep();
+    expect(
+      await f.service.describe({ canvas_id: first.canvas_id, limit: 100 }, f.ctx),
+    ).toMatchObject({
+      selection_coverage: [
+        {
+          selection_id: 'expiring',
+          partitions_present: [1],
+          final_partition: 1,
+          chain_complete: false,
+        },
+      ],
+    });
+  });
+  it('derives contiguous atomic coverage from live lineage and snapshots it for SQL replay', async () => {
+    const partition = (sequence: number, final: number | null = null) => ({
+      ...output(),
+      selection_partition: {
+        selection_id: 'retrieval-a',
+        partition: sequence,
+        final_partition: final,
+      },
+    });
+    const first = await f.service.stageRelations(
+      {},
+      partition(0),
+      [relation, { ...relation, relation: 'companion', rows: [] }],
+      f.ctx,
+    );
+    const duplicate = await f.service.stageRelations(
+      { canvas_id: first.canvas_id },
+      partition(0),
+      [relation, { ...relation, relation: 'companion', rows: [] }],
+      f.ctx,
+    );
+    const final = await f.service.stageRelations(
+      { canvas_id: first.canvas_id },
+      partition(2, 2),
+      [relation, { ...relation, relation: 'companion', rows: [] }],
+      f.ctx,
+    );
+    const describe = () => f.service.describe({ canvas_id: first.canvas_id, limit: 1 }, f.ctx);
+    expect(await describe()).toMatchObject({
+      selection_coverage: [
+        {
+          selection_id: 'retrieval-a',
+          partitions_present: [0, 2],
+          final_partition: 2,
+          chain_complete: false,
+        },
+      ],
+    });
+    await f.service.stageRelations(
+      { canvas_id: first.canvas_id },
+      partition(1),
+      [relation, { ...relation, relation: 'companion', rows: [] }],
+      f.ctx,
+    );
+    const complete = [
+      {
+        selection_id: 'retrieval-a',
+        partitions_present: [0, 1, 2],
+        final_partition: 2,
+        chain_complete: true,
+      },
+    ];
+    expect(await describe()).toMatchObject({ selection_coverage: complete });
+    const sql = 'SELECT 1 AS i UNION ALL SELECT 2';
+    const retained = await query(first.canvas_id, sql, { limit: 1 });
+    expect(retained).toMatchObject({
+      selection_coverage: complete,
+      source_complete: false,
+      truncated: false,
+    });
+    const instance = await f.canvas.acquire(first.canvas_id, f.ctx);
+    const companions = (await instance.describe()).filter((table) =>
+      table.name.startsWith('companion_'),
+    );
+    const firstCompanion = companions.find((table) =>
+      table.name.endsWith(first.table_name.split('_').at(-1)!),
+    );
+    const duplicateCompanion = companions.find((table) =>
+      table.name.endsWith(duplicate.table_name.split('_').at(-1)!),
+    );
+    if (!firstCompanion || !duplicateCompanion) throw new Error('Missing atomic companion');
+    await f.service.drop({ canvas_id: first.canvas_id, table_name: firstCompanion.name }, f.ctx);
+    expect(await describe()).toMatchObject({ selection_coverage: complete });
+    await f.service.drop(
+      { canvas_id: first.canvas_id, table_name: duplicateCompanion.name },
+      f.ctx,
+    );
+    expect(await describe()).toMatchObject({
+      selection_coverage: [{ partitions_present: [1, 2], chain_complete: false }],
+    });
+    expect(await query(first.canvas_id, sql, { cursor: retained.next_cursor })).toMatchObject({
+      selection_coverage: complete,
+      items: [{ i: 2 }],
+    });
+    const suffix = final.table_name.split('_').at(-1)!;
+    for (const table of await instance.describe())
+      if (table.name.endsWith(suffix))
+        await f.service.drop({ canvas_id: first.canvas_id, table_name: table.name }, f.ctx);
+    expect(await describe()).toMatchObject({
+      selection_coverage: [{ partitions_present: [1], final_partition: 2, chain_complete: false }],
+    });
+  });
+  it('groups a table schema once and counts whole tables', async () => {
+    const h = await stage();
+    const page = await f.service.describe({ canvas_id: h.canvas_id, limit: 100 }, f.ctx);
+    expect(page).toMatchObject({ returned: 1, totalCount: 1, has_more: false });
+    expect(page.items[0]).toMatchObject({ columns: relation.schema, row_count: 2 });
+  });
+  it('does not exhaust continuation capacity by replaying a SQL position', async () => {
+    const h = await stage();
+    const sql = 'SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2';
+    const first = await query(h.canvas_id, sql, { limit: 1 });
+    const instance = await f.canvas.acquire(h.canvas_id, f.ctx);
+    const tables = await instance.describe();
+    vi.spyOn(instance, 'describe').mockResolvedValue(tables);
+    vi.spyOn(f.canvas, 'acquire').mockResolvedValue(instance);
+    const started = performance.now();
+    const cpu = process.cpuUsage();
+    for (let i = 0; i < 4100; i++) {
+      const replay = await query(h.canvas_id, sql, { cursor: first.next_cursor, limit: 1 });
+      expect(replay.items).toEqual([{ value: 1 }]);
+    }
+    console.info('4100 retained SQL replays:', {
+      elapsedMs: performance.now() - started,
+      cpu: process.cpuUsage(cpu),
+    });
+  });
+  it('pages all live tables including empty schemas, rejects changed metadata, and clamps table limits', async () => {
+    const h = await f.service.stageRelations(
+      {},
+      output(true),
+      Array.from({ length: 16 }, (_, index) => ({
+        ...relation,
+        relation: `partition_${index}`,
+        rows: index % 2 ? [] : relation.rows,
+      })),
+      f.ctx,
+    );
+    let cursor: string | undefined;
+    const names: unknown[] = [];
+    do {
+      const page = await f.service.describe({ canvas_id: h.canvas_id, limit: 3, cursor }, f.ctx);
+      expect(page.totalCount).toBe(16);
+      expect(wireBytes(page)).toBeLessThan(24000);
+      expect(
+        page.items.every((item) => Array.isArray(item.columns) && item.columns.length === 2),
+      ).toBe(true);
+      names.push(...page.items.map((item) => item.table_name));
+      cursor = page.next_cursor;
+    } while (cursor);
+    expect(new Set(names).size).toBe(16);
+    expect(await f.service.describe({ canvas_id: h.canvas_id, limit: 101 }, f.ctx)).toMatchObject({
+      totalCount: 16,
+      has_more: true,
+      notices: ['Requested limit was clamped to 100.'],
+    });
+    const first = await f.service.describe({ canvas_id: h.canvas_id, limit: 1 }, f.ctx);
+    await f.service.drop(h, f.ctx);
+    await expect(
+      f.service.describe({ canvas_id: h.canvas_id, limit: 1, cursor: first.next_cursor }, f.ctx),
+    ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
+    await expect(
+      f.service.describe(
+        { canvas_id: h.canvas_id, limit: 1, cursor: 'eyJvZmZzZXQiOjk5OTk5fQ' },
+        f.ctx,
+      ),
+    ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
+  });
+  it('rejects forged, foreign and mode-incompatible SQL positions while retaining valid text replay after drop', async () => {
+    const h = await stage();
+    const foreign = await stage();
+    const value = '💧'.repeat(4000);
+    const sql = `SELECT '${value}' AS value UNION ALL SELECT 'last'`;
+    const error = (await query(h.canvas_id, sql).catch((cause: unknown) => cause)) as {
+      data: { record_cursor: string };
+    };
+    const record_cursor = error.data.record_cursor;
+    await f.service.drop(h, f.ctx);
+    const first = await query(h.canvas_id, sql, { view: 'text', record_cursor });
+    expect(await query(h.canvas_id, sql, { view: 'text', record_cursor })).toEqual(first);
+    expect(
+      await query(h.canvas_id, sql, { view: 'text', record_cursor, cursor: 'ignored-old-page' }),
+    ).toEqual(first);
+    expect(wireBytes(first)).toBeLessThan(24000);
+    for (const args of [
+      { cursor: record_cursor },
+      { view: 'text', record_cursor: `${record_cursor}x` },
+    ])
+      await expect(query(h.canvas_id, sql, args)).rejects.toMatchObject({
+        data: { reason: 'cursor_invalid' },
+      });
+    await expect(
+      query(foreign.canvas_id, sql, { view: 'text', record_cursor }),
+    ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
+    await expect(
+      f.service.query(
+        { canvas_id: h.canvas_id, sql, view: 'text', record_cursor, limit: 10 },
+        createMockContext({ tenantId: 'foreign' }),
+      ),
+    ).rejects.toMatchObject({ data: { reason: 'canvas_not_found' } });
+    let next = first;
+    let text = String(first.text);
+    while (next.phase === 'text') {
+      next = await query(h.canvas_id, sql, { view: 'text', record_cursor: next.next_cursor });
+      expect(wireBytes(next)).toBeLessThan(24000);
+      text += next.text;
+    }
+    expect(JSON.parse(text)).toEqual({ value });
+    expect(next.phase).toBe('records');
+    expect((await query(h.canvas_id, sql, { cursor: next.next_cursor })).items).toEqual([
+      { value: 'last' },
+    ]);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 900001);
+    await expect(query(h.canvas_id, sql, { view: 'text', record_cursor })).rejects.toMatchObject({
+      data: { reason: 'cursor_invalid' },
+    });
+  });
+  it('replays an immutable SQL position without advancing it', async () => {
+    const h = await stage();
+    const sql = `SELECT * FROM ${h.table_name} ORDER BY sampled`;
+    const first = await query(h.canvas_id, sql, { limit: 1 });
+    const next = await query(h.canvas_id, sql, { cursor: first.next_cursor });
+    expect(next.items).toEqual([{ value: 1.25, sampled: '2026-01-02' }]);
+    expect((await query(h.canvas_id, sql, { cursor: first.next_cursor })).items).toEqual(
+      next.items,
+    );
+  });
   it('uses declared SDWIS schemas for all-null numeric columns and sparse dates', async () => {
     const h = await f.service.stage(
       {
@@ -50,11 +293,11 @@ describe('real canvas service', () => {
       f.ctx,
     );
     const metadata = await f.service.describe({ canvas_id: h.canvas_id, limit: 100 }, f.ctx);
-    const columns = metadata.items.map((item) => item.column);
+    const columns = metadata.items.flatMap((item) => item.columns);
     let cursor = metadata.next_cursor;
     while (cursor) {
       const page = await f.service.describe({ canvas_id: h.canvas_id, limit: 100, cursor }, f.ctx);
-      columns.push(...page.items.map((item) => item.column));
+      columns.push(...page.items.flatMap((item) => item.columns));
       cursor = page.next_cursor;
     }
     expect(columns).toEqual(
@@ -78,7 +321,7 @@ describe('real canvas service', () => {
       pointer: CANVAS_POINTER,
     });
     const metadata = await f.service.describe({ canvas_id: handle.canvas_id, limit: 100 }, f.ctx);
-    expect(metadata.items.map((item) => item.column)).toEqual(
+    expect(metadata.items.flatMap((item) => item.columns)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: 'value', type: 'DOUBLE' }),
         expect.objectContaining({ name: 'sampled', type: 'DATE' }),
@@ -227,7 +470,7 @@ describe('real canvas service', () => {
       (await f.service.describe({ canvas_id: h.canvas_id, limit: 100 }, f.ctx)).items.map(
         (item) => item.table_name,
       ),
-    ).toEqual([h.table_name, h.table_name]);
+    ).toEqual([h.table_name]);
   });
 
   it('caps table admission and query rows while preserving incomplete aggregate lineage', async () => {
@@ -265,6 +508,7 @@ describe('real canvas service', () => {
 
   it('pages describe metadata and binds its cursor to the exact table selection', async () => {
     const h = await stage();
+    await f.service.stageRelations({ canvas_id: h.canvas_id }, output(), [relation], f.ctx);
     const first = await f.service.describe({ canvas_id: h.canvas_id, limit: 1 }, f.ctx);
     const second = await f.service.describe(
       { canvas_id: h.canvas_id, limit: 1, cursor: first.next_cursor },

@@ -1,6 +1,9 @@
-/** @fileoverview Capability-scoped atomic staging and bounded immutable SQL pagination. */
-import { randomBytes } from 'node:crypto';
-import type { Context } from '@cyanheads/mcp-ts-core';
+/**
+ * @fileoverview Capability-scoped atomic staging and bounded immutable SQL pagination.
+ * @module services/dataframe/canvas-service
+ */
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { type Context, z } from '@cyanheads/mcp-ts-core';
 import type {
   CanvasInstance,
   ColumnSchema,
@@ -17,20 +20,50 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { type PublicRow, type Table, tableSchemas } from '@/domain/sdwis-contracts.js';
-import { type SourceOutput, wireBytes } from '@/domain/source-output.js';
+import {
+  fitTextChunk,
+  INLINE_BUDGET_BYTES,
+  packItems,
+  RESPONSE_LIMIT_BYTES,
+  type SelectionCoverage,
+  type SourceOutput,
+  wireBytes,
+} from '@/domain/source-output.js';
 import type { SourcePartition } from '@/services/sdwis/drinking-water-service.js';
 
 /** Every capability carries executable next steps. */
 export const CANVAS_POINTER =
   'Use sdwis_dataframe_describe with this canvas_id to inspect table names and columns, then sdwis_dataframe_query with this canvas_id to analyze the staged rows.';
 const TTL_MS = 3600000;
-const capacityHint =
-  'Reuse a canvas_id you already hold, wait for expiry, or narrow the source selection.';
+/** Upper bound for signed position tokens, including describe selection fingerprints. */
+const CURSOR_PLACEHOLDER = 'x'.repeat(384);
+const capacityExhausted = () =>
+  rateLimited(
+    'Reuse a canvas_id you already hold, wait for expiry, or narrow the source selection.',
+    { reason: 'canvas_capacity_exhausted', retryable: true },
+  );
+const cursorSchema = z
+  .object({
+    kind: z.enum(['describe', 'query']),
+    entry: z.string(),
+    offset: z.number().int().nonnegative(),
+    textOffset: z.number().int().nonnegative().optional(),
+    expires: z.number().int(),
+  })
+  .strict();
+/** A table expires with its own TTL or its canvas, whichever comes first. */
+function tableExpiry(table: TableInfo, instance: CanvasInstance): string {
+  return new Date(
+    Math.min(Date.parse(table.expiresAt ?? instance.expiresAt), Date.parse(instance.expiresAt)),
+  ).toISOString();
+}
 interface Lineage {
   effective_filters: Record<string, unknown>;
   next_cursor?: string;
   provenance: SourceOutput['provenance'];
   relation: string;
+  required_relations?: string[];
+  selection_partition?: SourceOutput['selection_partition'];
   source_complete: boolean;
 }
 interface State {
@@ -43,7 +76,6 @@ interface State {
 }
 interface Waiter {
   abort: () => void;
-  reject: (cause: unknown) => void;
   resolve: () => void;
   signal: AbortSignal;
   state: State;
@@ -60,22 +92,25 @@ interface CacheEntry {
   expires: number;
   lineage: Lineage[];
   result: QueryResult;
+  selection_coverage: SelectionCoverage;
   sql: string;
   tenant: string;
 }
-interface Cursor {
-  entry: string;
-  offset: number;
-  textOffset?: number;
-}
+type Cursor = z.infer<typeof cursorSchema>;
 interface DescribeOutput extends Record<string, unknown> {
   canvas_id: string;
+  encoding?: 'json';
   has_more: boolean;
   items: Record<string, unknown>[];
   next_cursor?: string;
   notices: string[];
+  offset?: number;
+  phase?: 'records' | 'text';
   pointer: string;
+  record_identity?: string;
   returned: number;
+  selection_coverage: SelectionCoverage;
+  text?: string;
   totalCount: number;
 }
 interface SqlOutput extends Record<string, unknown> {
@@ -93,6 +128,7 @@ interface SqlOutput extends Record<string, unknown> {
   record_identity?: string;
   returned: number;
   row_count: number;
+  selection_coverage: SelectionCoverage;
   source_complete: boolean;
   text?: string;
   truncated: boolean;
@@ -107,7 +143,7 @@ export interface QueryInput {
   view: 'records' | 'text';
 }
 /** Explicitly typed source schema, including columns absent from sparse rows. */
-export function sourceSchema(table: Table, rows: PublicRow[]): ColumnSchema[] {
+function sourceSchema(table: Table, rows: PublicRow[]): ColumnSchema[] {
   const json = tableSchemas[table].toJSONSchema();
   const properties = json.properties ?? {};
   const names = new Set([...Object.keys(properties), ...rows.flatMap((row) => Object.keys(row))]);
@@ -141,7 +177,7 @@ export class CanvasService {
   private active = 0;
   private waiting: Waiter[] = [];
   private cache = new Map<string, CacheEntry>();
-  private cursors = new Map<string, Cursor>();
+  private readonly cursorSecret = randomBytes(32);
   constructor(canvas: DataCanvas, configuredRowLimit: number) {
     this.canvas = canvas;
     this.rowLimit = Math.min(configuredRowLimit, 25000);
@@ -152,8 +188,36 @@ export class CanvasService {
       if (!state.busy && !state.queue.length && Date.parse(state.expiresAt) <= Date.now())
         this.states.delete(state);
     for (const [key, entry] of this.cache) if (entry.expires <= Date.now()) this.cache.delete(key);
-    for (const [key, cursor] of this.cursors)
-      if (!this.cache.has(cursor.entry)) this.cursors.delete(key);
+  }
+  private mintCursor(position: Cursor): string {
+    const payload = Buffer.from(JSON.stringify(position)).toString('base64url');
+    const signature = createHmac('sha256', this.cursorSecret).update(payload).digest('base64url');
+    return `${payload}.${signature}`;
+  }
+  private readCursor(token: string, kind: Cursor['kind']): Cursor {
+    const [payload, signature, extra] = token.split('.');
+    if (payload && signature && extra === undefined) {
+      const expected = createHmac('sha256', this.cursorSecret).update(payload).digest();
+      const supplied = Buffer.from(signature, 'base64url');
+      if (
+        supplied.toString('base64url') === signature &&
+        supplied.length === expected.length &&
+        timingSafeEqual(supplied, expected)
+      ) {
+        let decoded: unknown;
+        try {
+          decoded = JSON.parse(Buffer.from(payload, 'base64url').toString());
+        } catch {
+          // Invalid JSON is rejected by the same cursor contract below.
+        }
+        const parsed = cursorSchema.safeParse(decoded);
+        if (parsed.success && parsed.data.kind === kind && parsed.data.expires > Date.now())
+          return parsed.data;
+      }
+    }
+    throw validationError('Continuation expired or does not match this selection.', {
+      reason: 'cursor_invalid',
+    });
   }
   private pump(): void {
     for (let i = 0; i < this.waiting.length && this.active < 2; ) {
@@ -192,8 +256,7 @@ export class CanvasService {
           canvas_id: instance.canvasId,
         });
       }
-      if (this.states.size >= 8)
-        throw rateLimited(capacityHint, { reason: 'canvas_capacity_exhausted', retryable: true });
+      if (this.states.size >= 8) throw capacityExhausted();
       state = {
         tenant,
         expiresAt: new Date(Date.now() + TTL_MS).toISOString(),
@@ -207,7 +270,7 @@ export class CanvasService {
     const held = state;
     if (held.queue.length >= 4) {
       if (reservedNew) this.states.delete(held);
-      throw rateLimited(capacityHint, { reason: 'canvas_capacity_exhausted', retryable: true });
+      throw capacityExhausted();
     }
     try {
       await new Promise<void>((resolve, reject) => {
@@ -215,7 +278,6 @@ export class CanvasService {
           signal: ctx.signal,
           state: held,
           resolve,
-          reject,
           abort: () => {
             const index = this.waiting.indexOf(waiter);
             if (index >= 0) this.waiting.splice(index, 1);
@@ -263,6 +325,49 @@ export class CanvasService {
       if (!tables.some((table) => table.name === key)) state.tables.delete(key);
     state.expiresAt = instance.expiresAt;
     return tables;
+  }
+  private coverage(state: State): SelectionCoverage {
+    const selections = new Map<
+      string,
+      {
+        final: number | null;
+        partitions: Map<number, { required: Set<string>; present: Set<string> }>;
+      }
+    >();
+    for (const lineage of state.tables.values()) {
+      const position = lineage.selection_partition;
+      if (!position) continue;
+      let selection = selections.get(position.selection_id);
+      if (!selection) {
+        selection = { final: null, partitions: new Map() };
+        selections.set(position.selection_id, selection);
+      }
+      if (position.final_partition !== null) selection.final = position.final_partition;
+      let partition = selection.partitions.get(position.partition);
+      if (!partition) {
+        partition = { required: new Set(), present: new Set() };
+        selection.partitions.set(position.partition, partition);
+      }
+      for (const relation of lineage.required_relations ?? []) partition.required.add(relation);
+      partition.present.add(lineage.relation);
+    }
+    return [...selections].map(([selection_id, selection]) => {
+      const partitions_present = [...selection.partitions]
+        .filter(([, partition]) =>
+          [...partition.required].every((relation) => partition.present.has(relation)),
+        )
+        .map(([sequence]) => sequence)
+        .sort((a, b) => a - b);
+      return {
+        selection_id,
+        partitions_present,
+        final_partition: selection.final,
+        chain_complete:
+          selection.final !== null &&
+          partitions_present.length === selection.final + 1 &&
+          partitions_present.every((sequence, index) => sequence === index),
+      };
+    });
   }
   private async executeQuery(
     instance: CanvasInstance,
@@ -338,7 +443,7 @@ export class CanvasService {
           live.length + relations.length > 16 ||
           live.reduce((sum, table) => sum + table.rowCount, 0) + rows > 250000
         )
-          throw rateLimited(capacityHint, { reason: 'canvas_capacity_exhausted', retryable: true });
+          throw capacityExhausted();
         const suffix = randomBytes(8).toString('hex');
         const created: string[] = [];
         try {
@@ -362,22 +467,34 @@ export class CanvasService {
               provenance: output.provenance,
               effective_filters: output.effective_filters,
               relation: relation.relation,
+              ...(output.selection_partition
+                ? {
+                    selection_partition: { ...output.selection_partition },
+                    required_relations: relations.map((entry) => entry.relation),
+                  }
+                : {}),
               ...(output.next_cursor ? { next_cursor: output.next_cursor } : {}),
             });
           }
           const first = created[0];
           const table = tables.find((candidate) => candidate.name === first);
           if (!first || !table) throw new Error('Registered partition is absent from canvas.');
+          const position = output.selection_partition;
+          if (position && position.final_partition !== null)
+            for (const [name, lineage] of state.tables)
+              if (lineage.selection_partition?.selection_id === position.selection_id)
+                state.tables.set(name, {
+                  ...lineage,
+                  selection_partition: {
+                    ...lineage.selection_partition,
+                    final_partition: position.final_partition,
+                  },
+                });
           return {
             canvas_id: instance.canvasId,
             table_name: first,
             row_count: table.rowCount,
-            expires_at: new Date(
-              Math.min(
-                Date.parse(table.expiresAt ?? instance.expiresAt),
-                Date.parse(instance.expiresAt),
-              ),
-            ).toISOString(),
+            expires_at: tableExpiry(table, instance),
             source_complete: output.source_complete,
             pointer: CANVAS_POINTER,
             ...(output.next_cursor ? { next_cursor: output.next_cursor } : {}),
@@ -399,6 +516,8 @@ export class CanvasService {
       table_name?: string | undefined;
       cursor?: string | undefined;
       limit: number;
+      view?: 'records' | 'text' | undefined;
+      record_cursor?: string | undefined;
     },
     ctx: Context,
   ) {
@@ -406,24 +525,60 @@ export class CanvasService {
       const tables = (await this.reconcile(instance, state, ctx.signal)).filter(
         (table) => !input.table_name || table.name === input.table_name,
       );
-      const items = tables.flatMap((table) =>
-        table.columns.map((column) => ({
-          table_name: table.name,
-          row_count: table.rowCount,
-          expires_at: new Date(
-            Math.min(
-              Date.parse(table.expiresAt ?? instance.expiresAt),
-              Date.parse(instance.expiresAt),
-            ),
-          ).toISOString(),
-          column,
-          ...state.tables.get(table.name),
-        })),
-      );
-      const offset = input.cursor
-        ? this.readDescribeCursor(input.cursor, input.canvas_id, input.table_name)
-        : 0;
+      const items = tables.map((table) => ({
+        table_name: table.name,
+        row_count: table.rowCount,
+        expires_at: tableExpiry(table, instance),
+        columns: table.columns,
+        ...state.tables.get(table.name),
+      }));
+      const supplied = input.view === 'text' ? input.record_cursor : input.cursor;
+      if (
+        (input.view === 'text' && (!supplied || input.cursor)) ||
+        (input.view !== 'text' && input.record_cursor)
+      )
+        throw validationError('Text view requires record_cursor; records view uses cursor.', {
+          reason: 'cursor_invalid',
+        });
+      // Metadata must remain identical throughout records/text paging; no second cache is needed.
+      const entry = createHash('sha256')
+        .update(
+          JSON.stringify({
+            canvas: input.canvas_id,
+            tenant: state.tenant,
+            table: input.table_name ?? null,
+            items,
+          }),
+        )
+        .digest('base64url');
+      const cursor = supplied ? this.readCursor(supplied, 'describe') : undefined;
+      if (
+        cursor &&
+        (cursor.entry !== entry ||
+          (input.view === 'text') !== (cursor.textOffset !== undefined) ||
+          cursor.offset > items.length)
+      )
+        throw validationError('Describe continuation does not match this live selection.', {
+          reason: 'cursor_invalid',
+        });
+      const offset = cursor?.offset ?? 0;
+      const expires =
+        cursor?.expires ??
+        Math.min(
+          Date.now() + 900000,
+          Date.parse(instance.expiresAt),
+          ...items.map((item) => Date.parse(item.expires_at)),
+        );
+      const mint = (position: number, textOffset?: number) =>
+        this.mintCursor({
+          kind: 'describe',
+          entry,
+          offset: position,
+          expires,
+          ...(textOffset === undefined ? {} : { textOffset }),
+        });
       const output: DescribeOutput = {
+        selection_coverage: this.coverage(state),
         canvas_id: instance.canvasId,
         pointer: CANVAS_POINTER,
         items: [],
@@ -432,65 +587,69 @@ export class CanvasService {
         has_more: false,
         notices: input.limit > 100 ? ['Requested limit was clamped to 100.'] : [],
       };
+      if (input.view === 'text') {
+        const item = items[offset];
+        const start = cursor?.textOffset;
+        if (!item || start === undefined)
+          throw validationError('Invalid oversized-table continuation.', {
+            reason: 'cursor_invalid',
+          });
+        const points = Array.from(JSON.stringify(item));
+        if (start >= points.length)
+          throw validationError('Invalid oversized-table offset.', { reason: 'cursor_invalid' });
+        output.encoding = 'json';
+        output.offset = start;
+        output.record_identity = `${entry}:${offset}`;
+        output.next_cursor = CURSOR_PLACEHOLDER;
+        const end = fitTextChunk(points, start, (candidate) => {
+          output.text = points.slice(start, candidate).join('');
+          return wireBytes(output);
+        });
+        output.text = points.slice(start, end).join('');
+        output.has_more = end < points.length || offset + 1 < items.length;
+        if (end < points.length) {
+          output.next_cursor = mint(offset, end);
+          output.phase = 'text';
+        } else if (offset + 1 < items.length) {
+          output.next_cursor = mint(offset + 1);
+          output.phase = 'records';
+        } else delete output.next_cursor;
+        return output;
+      }
       const page: typeof items = [];
       output.items = page;
-      for (const item of items.slice(offset, offset + Math.min(input.limit, 100))) {
-        page.push(item);
-        output.returned = page.length;
-        output.has_more = offset + page.length < items.length;
-        output.next_cursor = this.describeCursor(
-          input.canvas_id,
-          input.table_name,
-          offset + page.length,
-        );
-        if (wireBytes(output) >= 23000) {
-          page.pop();
-          break;
-        }
-      }
+      packItems(
+        page,
+        items.slice(offset, offset + Math.min(input.limit, 100)),
+        INLINE_BUDGET_BYTES,
+        () => {
+          output.returned = page.length;
+          output.has_more = offset + page.length < items.length;
+          output.next_cursor = CURSOR_PLACEHOLDER;
+          return wireBytes(output);
+        },
+      );
       output.returned = page.length;
       output.has_more = offset + page.length < items.length;
-      if (output.has_more)
-        output.next_cursor = this.describeCursor(
-          input.canvas_id,
-          input.table_name,
-          offset + page.length,
-        );
+      if (output.has_more) output.next_cursor = mint(offset + page.length);
       else delete output.next_cursor;
-      if (!page.length && offset < items.length)
-        throw validationError(
-          'Table metadata cannot fit inline; inspect a narrower table selection.',
-          { reason: 'item_too_large' },
-        );
+      if (!page.length && offset < items.length) {
+        const record_cursor = mint(offset, 0);
+        const follow_up = {
+          tool: 'sdwis_dataframe_describe',
+          canvas_id: input.canvas_id,
+          ...(input.table_name ? { table_name: input.table_name } : {}),
+          view: 'text',
+          record_cursor,
+        };
+        throw validationError('A complete table metadata item exceeds inline capacity.', {
+          reason: 'item_too_large',
+          record_cursor,
+          follow_up,
+          recovery: { hint: `Read the complete table metadata with ${JSON.stringify(follow_up)}.` },
+        });
+      }
       return output;
-    });
-  }
-  private describeCursor(canvas: string, table: string | undefined, offset: number): string {
-    return Buffer.from(JSON.stringify({ canvas, table: table ?? null, offset })).toString(
-      'base64url',
-    );
-  }
-  private readDescribeCursor(cursor: string, canvas: string, table: string | undefined): number {
-    try {
-      const parsed: unknown = JSON.parse(Buffer.from(cursor, 'base64url').toString());
-      if (
-        typeof parsed === 'object' &&
-        parsed !== null &&
-        'canvas' in parsed &&
-        parsed.canvas === canvas &&
-        'table' in parsed &&
-        parsed.table === (table ?? null) &&
-        'offset' in parsed &&
-        typeof parsed.offset === 'number' &&
-        Number.isSafeInteger(parsed.offset) &&
-        parsed.offset >= 0
-      )
-        return parsed.offset;
-    } catch {
-      /* Rejected below. */
-    }
-    throw validationError('Describe continuation does not match this selection.', {
-      reason: 'cursor_invalid',
     });
   }
   /** Execute once; every continuation reads the same bounded retained result. */
@@ -506,15 +665,16 @@ export class CanvasService {
           reason: 'cursor_invalid',
         });
       if (supplied) {
-        const pointer = this.cursors.get(supplied);
-        const retained = pointer && this.cache.get(pointer.entry);
+        const pointer = this.readCursor(supplied, 'query');
+        const retained = this.cache.get(pointer.entry);
         if (
-          !pointer ||
           !retained ||
           retained.canvas !== input.canvas_id ||
           retained.tenant !== state.tenant ||
           retained.sql !== input.sql ||
-          retained.expires <= Date.now()
+          retained.expires <= Date.now() ||
+          pointer.offset > retained.result.rows.length ||
+          (input.view === 'text') !== (pointer.textOffset !== undefined)
         )
           throw validationError('Query continuation expired or selection changed.', {
             reason: 'cursor_invalid',
@@ -526,8 +686,14 @@ export class CanvasService {
       } else {
         const result = await this.executeQuery(instance, input.sql, ctx.signal);
         ctx.signal.throwIfAborted();
+        const selection_coverage = this.coverage(state);
         const bytes = new TextEncoder().encode(
-          JSON.stringify({ result, lineage: [...state.tables.values()], sql: input.sql }),
+          JSON.stringify({
+            result,
+            lineage: [...state.tables.values()],
+            selection_coverage,
+            sql: input.sql,
+          }),
         ).byteLength;
         this.sweep();
         if (
@@ -546,12 +712,14 @@ export class CanvasService {
           sql: input.sql,
           result,
           lineage: [...state.tables.values()],
+          selection_coverage,
           expires: Date.now() + 900000,
           bytes,
         };
         this.cache.set(key, entry);
       }
       const output: SqlOutput = {
+        selection_coverage: entry.selection_coverage,
         canvas_id: instance.canvasId,
         pointer: CANVAS_POINTER,
         columns: entry.result.columns,
@@ -579,20 +747,14 @@ export class CanvasService {
           ...(input.limit > 100 ? ['Requested limit was clamped to 100.'] : []),
         ],
       };
-      const mint = (position: number, text?: number) => {
-        if (this.cursors.size >= 4096)
-          throw rateLimited('Query continuation capacity is full; wait for expiry.', {
-            reason: 'query_capacity_exhausted',
-            retryable: true,
-          });
-        const token = randomBytes(24).toString('base64url');
-        this.cursors.set(token, {
+      const mint = (position: number, text?: number) =>
+        this.mintCursor({
+          kind: 'query',
+          expires: entry.expires,
           entry: key,
           offset: position,
           ...(text === undefined ? {} : { textOffset: text }),
         });
-        return token;
-      };
       if (input.view === 'text') {
         const row = entry.result.rows[offset];
         if (!row || textOffset === undefined)
@@ -600,25 +762,23 @@ export class CanvasService {
             reason: 'cursor_invalid',
           });
         const points = Array.from(JSON.stringify(row));
-        let end = textOffset;
-        let upper = points.length;
+        if (textOffset >= points.length)
+          throw validationError('Invalid oversized-row offset.', { reason: 'cursor_invalid' });
+        const start = textOffset;
         output.encoding = 'json';
-        output.offset = textOffset;
+        output.offset = start;
         output.record_identity = `${key}:${offset}`;
         output.text = '';
-        output.next_cursor = 'x'.repeat(32);
-        // Search code-point boundaries rather than rendering every growing prefix.
-        while (end < upper) {
-          const candidate = Math.ceil((end + upper) / 2);
-          output.text = points.slice(textOffset, candidate).join('');
-          if (wireBytes(output) < 23000) end = candidate;
-          else upper = candidate - 1;
-        }
-        if (end === textOffset && end < points.length)
+        output.next_cursor = CURSOR_PLACEHOLDER;
+        const end = fitTextChunk(points, start, (candidate) => {
+          output.text = points.slice(start, candidate).join('');
+          return wireBytes(output);
+        });
+        if (end === start && end < points.length)
           throw validationError('Query metadata exceeds inline capacity; narrow SQL.', {
             reason: 'item_too_large',
           });
-        output.text = points.slice(textOffset, end).join('');
+        output.text = points.slice(start, end).join('');
         output.has_more = end < points.length || offset + 1 < entry.result.rows.length;
         if (end < points.length) {
           output.next_cursor = mint(offset, end);
@@ -630,32 +790,39 @@ export class CanvasService {
       } else {
         const page: Record<string, unknown>[] = [];
         output.items = page;
-        output.next_cursor = 'x'.repeat(32);
-        for (const row of entry.result.rows.slice(offset, offset + Math.min(input.limit, 100))) {
-          page.push(row);
-          output.returned = page.length;
-          if (wireBytes(output) >= 23000) {
-            page.pop();
-            break;
-          }
-        }
-        if (!page.length && offset < entry.result.rows.length)
+        output.next_cursor = CURSOR_PLACEHOLDER;
+        packItems(
+          page,
+          entry.result.rows.slice(offset, offset + Math.min(input.limit, 100)),
+          INLINE_BUDGET_BYTES,
+          () => {
+            output.returned = page.length;
+            return wireBytes(output);
+          },
+        );
+        if (!page.length && offset < entry.result.rows.length) {
+          const record_cursor = mint(offset, 0);
+          const follow_up = {
+            tool: 'sdwis_dataframe_query',
+            canvas_id: input.canvas_id,
+            view: 'text',
+            record_cursor,
+          };
           throw validationError('A complete SQL row exceeds inline capacity.', {
             reason: 'item_too_large',
-            record_cursor: mint(offset, 0),
-            follow_up: {
-              tool: 'sdwis_dataframe_query',
-              canvas_id: input.canvas_id,
-              sql: input.sql,
-              view: 'text',
+            record_cursor,
+            follow_up,
+            recovery: {
+              hint: `Repeat sdwis_dataframe_query with canvas_id ${input.canvas_id}, the same sql, view text and record_cursor ${record_cursor}.`,
             },
           });
+        }
         output.returned = page.length;
         output.has_more = offset + page.length < entry.result.rows.length;
         if (output.has_more) output.next_cursor = mint(offset + page.length);
         else delete output.next_cursor;
       }
-      if (wireBytes(output) >= 24000)
+      if (wireBytes(output) >= RESPONSE_LIMIT_BYTES)
         throw validationError('Query metadata exceeds inline capacity; narrow SQL.', {
           reason: 'item_too_large',
         });
@@ -664,30 +831,24 @@ export class CanvasService {
   }
   /** Missing capabilities and missing tables are both idempotent removal misses. */
   async drop(input: { canvas_id: string; table_name: string }, ctx: Context) {
+    const outcome = (dropped: boolean, remaining_tables: number) => ({
+      canvas_id: input.canvas_id,
+      pointer: CANVAS_POINTER,
+      table_name: input.table_name,
+      dropped,
+      remaining_tables,
+      notices: [dropped ? 'Staged table removed.' : 'No staged table remains to remove.'],
+    });
     try {
       return await this.operation(input.canvas_id, ctx, async (instance, state) => {
         ctx.signal.throwIfAborted();
         const dropped = await instance.drop(input.table_name);
         state.tables.delete(input.table_name);
-        return {
-          canvas_id: input.canvas_id,
-          pointer: CANVAS_POINTER,
-          table_name: input.table_name,
-          dropped,
-          remaining_tables: state.tables.size,
-          notices: [dropped ? 'Staged table removed.' : 'No staged table remains to remove.'],
-        };
+        return outcome(dropped, state.tables.size);
       });
     } catch (cause) {
       if (cause instanceof McpError && cause.data?.reason === 'canvas_not_found')
-        return {
-          canvas_id: input.canvas_id,
-          pointer: CANVAS_POINTER,
-          table_name: input.table_name,
-          dropped: false,
-          remaining_tables: 0,
-          notices: ['No staged table remains to remove.'],
-        };
+        return outcome(false, 0);
       throw cause;
     }
   }

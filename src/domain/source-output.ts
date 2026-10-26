@@ -10,7 +10,7 @@ export const rowSchema = z
   .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
   .describe('Flat allowlisted source fields; null represents unknown source data.');
 /** Public provenance, kept distinct from observation and snapshot dates. */
-export const provenanceSchema = z
+const provenanceSchema = z
   .object({
     source: z.string().describe('EPA source name.'),
     url: z.string().describe('Public source URL.'),
@@ -26,7 +26,7 @@ export const provenanceSchema = z
   })
   .describe('EPA attribution and retrieval provenance.');
 /** Dataset metadata is supplied exclusively by an actual staging service. */
-export const datasetSchema = z
+const datasetSchema = z
   .object({
     canvas_id: z.string().describe('Explicit capability for this canvas.'),
     table_name: z.string().describe('Staged partition table.'),
@@ -39,6 +39,45 @@ export const datasetSchema = z
     pointer: z.string().describe('Executable next steps for the canvas capability.'),
   })
   .describe('Live staged source partition.');
+/** Source-delivery identity is independent of filters and continuation work checkpoints. */
+const selectionPartitionSchema = z.object({
+  selection_id: z.string().describe('Stable identity of this source retrieval.'),
+  partition: z.number().int().nonnegative().describe('Zero-based delivered source partition.'),
+  final_partition: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .describe('Final source partition when exhaustion is known; otherwise null.'),
+});
+/** Canvas acquisition coverage does not establish SQL table lineage or result completeness. */
+export const selectionCoverageSchema = z
+  .array(
+    z
+      .object({
+        selection_id: z
+          .string()
+          .describe('Stable source retrieval identity, independent of filters.'),
+        partitions_present: z
+          .array(z.number().int().nonnegative())
+          .describe('Source partitions whose required relations are all live in this canvas.'),
+        final_partition: z
+          .number()
+          .int()
+          .nonnegative()
+          .nullable()
+          .describe('Observed final partition; null until exhaustion is known.'),
+        chain_complete: z
+          .boolean()
+          .describe(
+            'Every partition from zero through observed exhaustion and all required companions remain live; independent of SQL truncation and table references.',
+          ),
+      })
+      .describe('Acquisition coverage for one source retrieval across live canvas relations.'),
+  )
+  .describe('Canvas-wide source acquisition coverage, snapshotted for retained SQL results.');
+/** Compact source-chain coverage entry. */
+export type SelectionCoverage = z.infer<typeof selectionCoverageSchema>;
 /** Common source fields, including optional lossless oversized-record text chunks. */
 export const sourceOutputShape = {
   effective_filters: z
@@ -65,6 +104,9 @@ export const sourceOutputShape = {
   provenance: provenanceSchema,
   notices: z.array(z.string()).describe('Scope, paging and interpretation guidance.'),
   dataset: datasetSchema.optional(),
+  selection_partition: selectionPartitionSchema
+    .optional()
+    .describe('Delivered source position; membership-only work has no position.'),
   truncated: z
     .boolean()
     .optional()
@@ -113,4 +155,45 @@ export function wireBytes(result: Record<string, unknown>): number {
   return new TextEncoder().encode(
     JSON.stringify({ content: formatSource(result), structuredContent: result }),
   ).byteLength;
+}
+/** Inline packing stays below this many wire bytes, leaving room for trailing notices. */
+export const INLINE_BUDGET_BYTES = 23000;
+/** Hard ceiling for a complete serialized tool result. */
+export const RESPONSE_LIMIT_BYTES = 24000;
+/**
+ * Append whole candidates to `page` while `measure()` stays below `budgetBytes`; the crossing
+ * candidate is removed again, so no item is ever cut. `measure` sees the page with the candidate.
+ */
+export function packItems<T>(
+  page: T[],
+  candidates: readonly T[],
+  budgetBytes: number,
+  measure: () => number,
+): void {
+  for (const candidate of candidates) {
+    page.push(candidate);
+    if (measure() >= budgetBytes) {
+      page.pop();
+      return;
+    }
+  }
+}
+/**
+ * Largest code-point end at or after `start` whose chunk keeps the wire below the inline budget.
+ * `measure(end)` renders the response with the chunk `[start, end)` and returns its wire bytes.
+ */
+export function fitTextChunk(
+  points: readonly string[],
+  start: number,
+  measure: (end: number) => number,
+): number {
+  let end = start;
+  let upper = points.length;
+  // Binary search over code-point boundaries rather than rendering every growing prefix.
+  while (end < upper) {
+    const candidate = Math.ceil((end + upper) / 2);
+    if (measure(candidate) < INLINE_BUDGET_BYTES) end = candidate;
+    else upper = candidate - 1;
+  }
+  return end;
 }

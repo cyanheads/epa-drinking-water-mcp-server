@@ -13,8 +13,15 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { PublicRow, Table } from '@/domain/sdwis-contracts.js';
-import { normalizeSelectors } from '@/domain/source-inputs.js';
-import { type SourceOutput, wireBytes } from '@/domain/source-output.js';
+import { normalizeSelectors, selectionFilters } from '@/domain/source-inputs.js';
+import {
+  fitTextChunk,
+  INLINE_BUDGET_BYTES,
+  packItems,
+  RESPONSE_LIMIT_BYTES,
+  type SourceOutput,
+  wireBytes,
+} from '@/domain/source-output.js';
 import { type Predicate, readPage, type SourcePage } from './sdwis-client.js';
 
 /** A source partition submitted to the real canvas service; no synthetic handles are minted here. */
@@ -79,6 +86,8 @@ export function produceUcmr(input: UcmrInput, ctx: Context): Promise<SourceOutpu
         ? { state: parsed.state, state_basis: 'reported_legal_entity' }
         : {}),
       ...(typeof parsed.county === 'string' ? { county: parsed.county } : {}),
+      ...(typeof parsed.date_from === 'string' ? { date_from: parsed.date_from } : {}),
+      ...(typeof parsed.date_to === 'string' ? { date_to: parsed.date_to } : {}),
     },
     ctx,
   );
@@ -87,6 +96,13 @@ export function produceUcmr(input: UcmrInput, ctx: Context): Promise<SourceOutpu
 const caveat =
   'SDWIS is a quarterly publication of reported records; missing or resolved historical records do not establish current compliance or water safety.';
 const key = randomBytes(32);
+const JOB_TTL_MS = 900000;
+const WORK_BUDGET_MS = 45000;
+/** Reserve time to serialize a resumable checkpoint after an awaited membership read stops. */
+const MEMBERSHIP_CHECKPOINT_RESERVE_MS = 5000;
+const PAGE_SIZE = 1000;
+/** PWSIDs per `pwsid in (...)` fact query. */
+const BATCH_SIZE = 50;
 interface Job {
   associationOffset: number;
   associations: Set<string>;
@@ -99,6 +115,7 @@ interface Job {
   ids: string[];
   inFlight: boolean;
   offset: number;
+  partition: number;
   pending: PublicRow[];
   periodOffset: number;
   periods: Map<string, PublicRow>;
@@ -111,7 +128,7 @@ interface Job {
   sourcePages: Map<string, { etag?: string; last_modified?: string; fingerprint: string }>;
   step: number;
   table: Table;
-  text?: { row: PublicRow; offset: number };
+  text?: { row: PublicRow };
   tool: string;
   touched: number;
 }
@@ -147,17 +164,19 @@ function token(value: string): z.infer<typeof tokenSchema> {
     throw validationError('Invalid continuation payload.', { reason: 'cursor_invalid' });
   }
 }
-function cleanFilters(input: Record<string, unknown>): Record<string, unknown> {
-  const result = { ...input };
-  for (const name of ['cursor', 'record_cursor', 'view', 'limit', 'stage_max_rows', 'canvas_id'])
-    delete result[name];
-  return result;
-}
 function sameFilters(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
   return JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort());
 }
+/** Case-insensitive substring match of `query` against any string field; no query matches all. */
+function matchesQuery(row: PublicRow, query: unknown): boolean {
+  if (!query) return true;
+  const needle = String(query).toUpperCase();
+  return Object.values(row).some(
+    (value) => typeof value === 'string' && value.toUpperCase().includes(needle),
+  );
+}
 function sweep(): void {
-  for (const [id, job] of jobs) if (Date.now() - job.touched > 900000) jobs.delete(id);
+  for (const [id, job] of jobs) if (Date.now() - job.touched > JOB_TTL_MS) jobs.delete(id);
 }
 function capacity(): void {
   let bytes = 0;
@@ -210,6 +229,7 @@ function getJob(
     table !== 'ref_code_value';
   const job: Job = {
     deliveredRows: 0,
+    partition: 0,
     id: randomBytes(18).toString('base64url'),
     inFlight: false,
     tool,
@@ -263,18 +283,26 @@ function inventoryPredicates(filters: Record<string, unknown>): Predicate[] {
         : []),
   ];
 }
+/** `pwsid in (...)` over the job's current membership batch. */
+function batchPredicate(job: Job): Predicate {
+  const batch = job.ids.slice(job.batch * BATCH_SIZE, (job.batch + 1) * BATCH_SIZE);
+  return { column: 'pwsid', operator: 'in', value: batch.join(',') };
+}
 function factPredicates(job: Job): Predicate[] {
   const f = job.filters;
-  const batch = job.ids.slice(job.batch * 50, (job.batch + 1) * 50);
   const selected =
     job.table === 'water_system'
       ? inventoryPredicates(f)
       : job.table === 'ref_code_value'
         ? predicate('value_type', f.value_type)
-        : [{ column: 'pwsid', operator: 'in' as const, value: batch.join(',') }];
+        : [batchPredicate(job)];
   if (job.table === 'violation')
     selected.push(
-      ...predicate('contaminant_code', f.contaminant),
+      ...predicate(
+        'contaminant_code',
+        f.contaminant,
+        f.contaminant === '1030,5000' ? 'in' : 'equals',
+      ),
       ...predicate('violation_category_code', f.category),
       ...predicate(
         'is_health_based_ind',
@@ -306,35 +334,40 @@ function identity(row: PublicRow): string {
     row.treatment_id,
   ]);
 }
-function overlap(row: PublicRow, filters: Record<string, unknown>, table: Table): boolean {
+function overlap(
+  row: PublicRow,
+  filters: Record<string, unknown>,
+  table: Table,
+): boolean | undefined {
   if (!filters.date_from && !filters.date_to) return true;
   const [beginKey, endKey] =
     table === 'violation'
-      ? ['compl_per_begin_date', 'compl_per_end_date']
+      ? (['compl_per_begin_date', 'compl_per_end_date'] as const)
       : table === 'lcr_sample_result'
-        ? ['sampling_start_date', 'sampling_end_date']
-        : ['enforcement_date', 'enforcement_date'];
-  const begin = row[beginKey ?? ''];
-  const end = row[endKey ?? ''];
-  return (
-    typeof begin === 'string' &&
-    typeof end === 'string' &&
-    (!filters.date_from || end >= String(filters.date_from)) &&
-    (!filters.date_to || begin <= String(filters.date_to))
-  );
+        ? (['sampling_start_date', 'sampling_end_date'] as const)
+        : (['enforcement_date', 'enforcement_date'] as const);
+  const begin = row[beginKey];
+  const end = row[endKey];
+  const from = typeof filters.date_from === 'string' ? filters.date_from : undefined;
+  const to = typeof filters.date_to === 'string' ? filters.date_to : undefined;
+  if (typeof begin === 'string' && to && begin > to) return false;
+  if (typeof end === 'string' && from && end < from) return false;
+  // A known endpoint inside the requested interval proves overlap without inventing the other.
+  if (typeof begin === 'string' && (!from || begin >= from)) return true;
+  if (typeof end === 'string' && (!to || end <= to)) return true;
+  if (typeof begin === 'string' && typeof end === 'string') return true;
+  return undefined;
 }
-function hasUniqueSourceKey(table: string): boolean {
-  return [
-    'water_system',
-    'violation',
-    'enforcement_action',
-    'lcr_sample',
-    'ref_code_value',
-  ].includes(table);
-}
-function retain(job: Job, page: SourcePage): void {
-  const tablePath = new URL(page.url).pathname.split('/')[2] ?? '';
-  const sourceKey = `${tablePath}:${job.batch}:${job.phase}`;
+/** Tables whose sort key is unique, so a repeated page or boundary row means paging stalled. */
+const uniqueKeyTables = new Set<Table>([
+  'water_system',
+  'violation',
+  'enforcement_action',
+  'lcr_sample',
+  'ref_code_value',
+]);
+function retain(job: Job, table: Table, page: SourcePage): void {
+  const sourceKey = `${table}:${job.batch}:${job.phase}`;
   const previous = job.sourcePages.get(sourceKey);
   if (
     previous &&
@@ -347,11 +380,7 @@ function retain(job: Job, page: SourcePage): void {
       reason: 'source_changed',
     });
   const fingerprint = createHmac('sha256', key).update(JSON.stringify(page.rows)).digest('hex');
-  if (
-    hasUniqueSourceKey(tablePath.replace(/^sdwis\./, '')) &&
-    page.rows.length &&
-    previous?.fingerprint === fingerprint
-  )
+  if (uniqueKeyTables.has(table) && page.rows.length && previous?.fingerprint === fingerprint)
     throw serviceUnavailable('EPA repeated a source page without progress.', {
       reason: 'upstream_paging_changed',
     });
@@ -363,27 +392,24 @@ function retain(job: Job, page: SourcePage): void {
   job.provenance = page;
 }
 const codeLabels = new Map<string, { label: string | null; expires: number }>();
+/** Code columns decoded per table, each with its `ref_code_value` value type. */
+const labelColumns: Partial<Record<Table, [column: string, valueType: string][]>> = {
+  violation: [
+    ['contaminant_code', 'CONTAMINANT_CODE'],
+    ['violation_code', 'VIOLATION_CODE'],
+    ['violation_category_code', 'VIOLATION_CATEGORY_CODE'],
+  ],
+  enforcement_action: [['enforcement_action_type_code', 'ENFORCEMENT_ACTION_TYPE_CODE']],
+  treatment: [
+    ['treatment_objective_code', 'TREATMENT_OBJECTIVE_CODE'],
+    ['treatment_process_code', 'TREATMENT_PROCESS_CODE'],
+  ],
+  lcr_sample_result: [['contaminant_code', 'CONTAMINANT_CODE']],
+};
 /** Decode source codes through composite dictionary keys; absent descriptions remain null. */
 async function enrichLabels(table: Table, rows: PublicRow[], signal: AbortSignal): Promise<number> {
-  const mappings: [string, string][] =
-    table === 'violation'
-      ? [
-          ['contaminant_code', 'CONTAMINANT_CODE'],
-          ['violation_code', 'VIOLATION_CODE'],
-          ['violation_category_code', 'VIOLATION_CATEGORY_CODE'],
-        ]
-      : table === 'enforcement_action'
-        ? [['enforcement_action_type_code', 'ENFORCEMENT_ACTION_TYPE_CODE']]
-        : table === 'treatment'
-          ? [
-              ['treatment_objective_code', 'TREATMENT_OBJECTIVE_CODE'],
-              ['treatment_process_code', 'TREATMENT_PROCESS_CODE'],
-            ]
-          : table === 'lcr_sample_result'
-            ? [['contaminant_code', 'CONTAMINANT_CODE']]
-            : [];
   let pages = 0;
-  for (const [column, valueType] of mappings) {
+  for (const [column, valueType] of labelColumns[table] ?? []) {
     const codes = [
       ...new Set(rows.flatMap((row) => (typeof row[column] === 'string' ? [row[column]] : []))),
     ];
@@ -396,7 +422,7 @@ async function enrichLabels(table: Table, rows: PublicRow[], signal: AbortSignal
         { column: 'value_type', operator: 'equals', value: valueType },
         { column: 'value_code', operator: 'in', value: missing.join(',') },
       ];
-      const page = await readPage('ref_code_value', predicates, 1, 1000, signal);
+      const page = await readPage('ref_code_value', predicates, 1, PAGE_SIZE, signal);
       pages++;
       const labels = new Map(
         page.rows.map((row) => [
@@ -428,21 +454,54 @@ async function advance(
   target: number,
   signal: AbortSignal,
   membershipOnly = false,
-): Promise<void> {
+): Promise<{ examined: number; unknown: number }> {
   let pages = 0;
+  let examined = 0;
+  let unknown = 0;
+  const workDeadline = Date.now() + WORK_BUDGET_MS;
+  const membershipDeadline = workDeadline - MEMBERSHIP_CHECKPOINT_RESERVE_MS;
+  let readMembership = false;
+  /** Read and retain one membership or companion page. */
+  const read = async (table: Table, predicates: Predicate[], offset: number) => {
+    const membership = job.phase === 'inventory' || job.phase === 'geography';
+    const checkpoint = new AbortController();
+    const timer = membership
+      ? setTimeout(
+          () =>
+            checkpoint.abort(new DOMException('Membership checkpoint reached.', 'TimeoutError')),
+          Math.max(0, membershipDeadline - Date.now()),
+        )
+      : undefined;
+    try {
+      const pageSignal = membership ? AbortSignal.any([signal, checkpoint.signal]) : signal;
+      const page = await readPage(table, predicates, offset, PAGE_SIZE, pageSignal);
+      // An upstream ignoring abort must not commit a page after the checkpoint.
+      pageSignal.throwIfAborted();
+      pages++;
+      retain(job, table, page);
+      return page;
+    } catch (error) {
+      signal.throwIfAborted();
+      if (checkpoint.signal.aborted && error === checkpoint.signal.reason) return;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   while (pages < 17 && job.pending.length < target && job.phase !== 'done') {
     signal.throwIfAborted();
+    if (
+      (job.phase === 'inventory' || job.phase === 'geography') &&
+      Date.now() >= membershipDeadline
+    )
+      break;
     if (membershipOnly && job.phase === 'facts') break;
+    // Do not begin fact I/O with less than one normal request window after a slow membership walk.
+    if (readMembership && job.phase === 'facts' && workDeadline - Date.now() < 15000) break;
     if (job.phase === 'inventory') {
-      const page = await readPage(
-        'water_system',
-        inventoryPredicates(job.filters),
-        job.offset,
-        1000,
-        signal,
-      );
-      pages++;
-      retain(job, page);
+      const page = await read('water_system', inventoryPredicates(job.filters), job.offset);
+      if (!page) break;
+      readMembership = true;
       for (const row of page.rows) job.ids.push(String(row.pwsid));
       job.ids = [...new Set(job.ids)];
       if (job.ids.length > 100000)
@@ -450,29 +509,27 @@ async function advance(
           reason: 'selection_capacity_exhausted',
         });
       job.offset += page.rows.length;
-      if (page.rows.length < 1000) {
+      if (page.rows.length < PAGE_SIZE) {
         job.phase = job.filters.county ? 'geography' : 'facts';
         job.offset = 1;
       }
       continue;
     }
     if (job.phase === 'geography') {
-      const page = await readPage(
+      const page = await read(
         'geographic_area',
         predicate('county_served', job.filters.county),
         job.offset,
-        1000,
-        signal,
       );
-      pages++;
-      retain(job, page);
+      if (!page) break;
+      readMembership = true;
       for (const row of page.rows) job.geographicIds.add(String(row.pwsid));
       if (job.geographicIds.size > 100000)
         throw rateLimited('County membership exceeds the selection budget; narrow the selection.', {
           reason: 'selection_capacity_exhausted',
         });
       job.offset += page.rows.length;
-      if (page.rows.length < 1000) {
+      if (page.rows.length < PAGE_SIZE) {
         if (job.table !== 'water_system')
           job.ids = job.ids.filter((id) => job.geographicIds.has(id));
         job.phase = 'facts';
@@ -483,53 +540,43 @@ async function advance(
     if (
       job.table !== 'water_system' &&
       job.table !== 'ref_code_value' &&
-      job.batch * 50 >= job.ids.length
+      job.batch * BATCH_SIZE >= job.ids.length
     ) {
       job.phase = 'done';
       break;
     }
-    const batch = job.ids.slice(job.batch * 50, (job.batch + 1) * 50);
     if (!job.periodsComplete) {
-      const page = await readPage(
-        'lcr_sample',
-        [{ column: 'pwsid', operator: 'in', value: batch.join(',') }],
-        job.periodOffset,
-        1000,
-        signal,
-      );
-      pages++;
-      retain(job, page);
+      const page = await read('lcr_sample', [batchPredicate(job)], job.periodOffset);
+      if (!page) break;
       for (const row of page.rows) job.periods.set(`${row.pwsid}:${row.sample_id}`, row);
       job.periodOffset += page.rows.length;
-      if (page.rows.length < 1000) job.periodsComplete = true;
+      if (page.rows.length < PAGE_SIZE) job.periodsComplete = true;
       capacity();
       continue;
     }
     if (!job.associationsComplete) {
-      const page = await readPage(
+      const page = await read(
         'violation_enf_assoc',
         [
           ...predicate('pwsid', job.filters.pwsid),
           ...predicate('violation_id', job.filters.violation_id),
         ],
         job.associationOffset,
-        1000,
-        signal,
       );
-      pages++;
-      retain(job, page);
+      if (!page) break;
       for (const row of page.rows) job.associations.add(`${row.pwsid}:${row.enforcement_id}`);
       job.associationOffset += page.rows.length;
-      if (page.rows.length < 1000) job.associationsComplete = true;
+      if (page.rows.length < PAGE_SIZE) job.associationsComplete = true;
       capacity();
       continue;
     }
-    const page = await readPage(job.table, factPredicates(job), job.offset, 1000, signal);
+    const page = await readPage(job.table, factPredicates(job), job.offset, PAGE_SIZE, signal);
     pages++;
+    // retain() fingerprints the rows after labels are attached; keep this order.
     pages += await enrichLabels(job.table, page.rows, signal);
-    retain(job, page);
+    retain(job, job.table, page);
     if (
-      hasUniqueSourceKey(job.table) &&
+      uniqueKeyTables.has(job.table) &&
       page.rows.length &&
       job.previousBoundary === JSON.stringify(page.rows[0])
     )
@@ -565,24 +612,19 @@ async function advance(
         !job.associations.has(`${row.pwsid}:${row.enforcement_id}`)
       )
         continue;
-      if (
-        job.filters.query &&
-        !Object.values(row).some(
-          (value) =>
-            typeof value === 'string' &&
-            value.toUpperCase().includes(String(job.filters.query).toUpperCase()),
-        )
-      )
-        continue;
-      if (!overlap(row, job.filters, job.table)) continue;
+      if (!matchesQuery(row, job.filters.query)) continue;
+      examined++;
+      const overlaps = overlap(row, job.filters, job.table);
+      if (overlaps === undefined) unknown++;
+      if (!overlaps) continue;
       job.pending.push(row);
     }
     job.offset += page.rows.length;
-    if (page.rows.length < 1000) {
+    if (page.rows.length < PAGE_SIZE) {
       if (
         job.table === 'water_system' ||
         job.table === 'ref_code_value' ||
-        (job.batch + 1) * 50 >= job.ids.length
+        (job.batch + 1) * BATCH_SIZE >= job.ids.length
       )
         job.phase = 'done';
       else {
@@ -596,6 +638,33 @@ async function advance(
     }
     capacity();
   }
+  return { examined, unknown };
+}
+function outputPhase(job: Job): SourceOutput['phase'] {
+  return job.phase === 'inventory' || job.phase === 'geography' ? 'membership' : 'source';
+}
+function provenance(job: Job): SourceOutput['provenance'] {
+  return {
+    source: 'EPA SDWIS DMAP',
+    url: job.provenance?.url ?? 'https://www.epa.gov/enviro/envirofacts-data-service-api',
+    retrieved_at: job.provenance?.retrieved_at ?? new Date().toISOString(),
+    ...(job.provenance?.etag ? { etag: job.provenance.etag } : {}),
+    ...(job.provenance?.last_modified ? { last_modified: job.provenance.last_modified } : {}),
+    consistency: 'quarterly_non_atomic',
+    caveats: [
+      caveat,
+      ...(job.filters.state
+        ? [
+            'State matches the reported legal entity; county membership intersected with legal-entity state is not a complete physical service-boundary map.',
+          ]
+        : []),
+      ...(job.table === 'lcr_sample_result'
+        ? [
+            'PB90/CU90 are Lead and Copper Rule summaries, not individual household samples. Missing sample periods remain unknown.',
+          ]
+        : []),
+    ],
+  };
 }
 function envelope(job: Job, limit: number, notices: string[]): SourceOutput {
   return {
@@ -604,29 +673,9 @@ function envelope(job: Job, limit: number, notices: string[]): SourceOutput {
     returned: 0,
     limit,
     has_more: job.phase !== 'done' || job.pending.length > 0,
-    phase: job.phase === 'inventory' || job.phase === 'geography' ? 'membership' : 'source',
+    phase: outputPhase(job),
     source_complete: false,
-    provenance: {
-      source: 'EPA SDWIS DMAP',
-      url: job.provenance?.url ?? 'https://www.epa.gov/enviro/envirofacts-data-service-api',
-      retrieved_at: job.provenance?.retrieved_at ?? new Date().toISOString(),
-      ...(job.provenance?.etag ? { etag: job.provenance.etag } : {}),
-      ...(job.provenance?.last_modified ? { last_modified: job.provenance.last_modified } : {}),
-      consistency: 'quarterly_non_atomic',
-      caveats: [
-        caveat,
-        ...(job.filters.state
-          ? [
-              'State matches the reported legal entity; county membership intersected with legal-entity state is not a complete physical service-boundary map.',
-            ]
-          : []),
-        ...(job.table === 'lcr_sample_result'
-          ? [
-              'PB90/CU90 are Lead and Copper Rule summaries, not individual household samples. Missing sample periods remain unknown.',
-            ]
-          : []),
-      ],
-    },
+    provenance: provenance(job),
     notices,
   };
 }
@@ -641,14 +690,14 @@ export async function resolveMembership(
   ctx: Context,
 ): Promise<{ pwsids: ReadonlySet<string>; source_complete: boolean; next_cursor?: string }> {
   const normalized = normalizeSelectors({ ...input });
-  const job = getJob('sdwis_membership', 'violation', cleanFilters(normalized), input.cursor);
+  const job = getJob('sdwis_membership', 'violation', selectionFilters(normalized), input.cursor);
   if (job.inFlight)
     throw rateLimited('Membership selection already has an active call.', {
       reason: 'selection_capacity_exhausted',
     });
   job.inFlight = true;
   try {
-    await advance(job, 1, AbortSignal.any([ctx.signal, AbortSignal.timeout(45000)]), true);
+    await advance(job, 1, AbortSignal.any([ctx.signal, AbortSignal.timeout(WORK_BUDGET_MS)]), true);
     job.step++;
     const complete = job.phase === 'facts' || job.phase === 'done';
     return {
@@ -692,7 +741,7 @@ export async function produceSource(
     const previous = jobs.get(parsed.job);
     if (
       previous &&
-      Date.now() - previous.touched <= 900000 &&
+      Date.now() - previous.touched <= JOB_TTL_MS &&
       previous.tool === tool &&
       previous.table === table &&
       !previous.inFlight &&
@@ -703,7 +752,7 @@ export async function produceSource(
       return structuredClone(previous.replay.result);
     }
   }
-  const job = getJob(tool, table, cleanFilters(normalized), cursor);
+  const job = getJob(tool, table, selectionFilters(normalized), cursor);
   if (job.inFlight)
     throw rateLimited(
       'This source selection already has an active call; wait for it before continuing.',
@@ -712,15 +761,7 @@ export async function produceSource(
   job.inFlight = true;
   try {
     if (bundledRows && !cursor) {
-      job.pending = bundledRows.filter(
-        (row) =>
-          !input.query ||
-          Object.values(row).some(
-            (value) =>
-              typeof value === 'string' &&
-              value.toUpperCase().includes(String(input.query).toUpperCase()),
-          ),
-      );
+      job.pending = bundledRows.filter((row) => matchesQuery(row, input.query));
       job.phase = 'done';
     }
     const limit = Math.min(100, Number(input.limit ?? 10));
@@ -741,31 +782,34 @@ export async function produceSource(
           'Text view requires the record_cursor returned for this oversized record.',
           { reason: 'cursor_invalid' },
         );
-      const pointer = token(cursor);
       const points = Array.from(JSON.stringify(job.text.row));
-      const offset = pointer.offset ?? 0;
-      let end = offset;
-      let upper = points.length;
+      const offset = token(cursor).offset ?? 0;
+      result.selection_partition = {
+        selection_id: job.id,
+        partition: job.partition,
+        final_partition: null,
+      };
       result.record_identity = identity(job.text.row);
       result.encoding = 'json';
       result.offset = offset;
-      // Include the exact signed offset token in each logarithmic wire-size probe.
-      while (end < upper) {
-        const candidate = Math.ceil((end + upper) / 2);
+      // Each probe carries the exact signed offset token it would return.
+      const end = fitTextChunk(points, offset, (candidate) => {
         result.text = points.slice(offset, candidate).join('');
         result.has_more = candidate < points.length;
         result.next_cursor = sign(job, 'text', candidate);
-        if (wireBytes(result) < 23000) end = candidate;
-        else upper = candidate - 1;
-      }
+        return wireBytes(result);
+      });
       result.text = points.slice(offset, end).join('');
       result.has_more = end < points.length;
       if (result.has_more) result.next_cursor = sign(job, 'text', end);
       else {
         if (job.pending[0] === job.text.row) job.pending.shift();
         job.deliveredRows++;
+        job.partition++;
         job.step++;
         result.has_more = job.phase !== 'done' || job.pending.length > 0;
+        if (!result.has_more)
+          result.selection_partition.final_partition = result.selection_partition.partition;
         result.phase = 'source';
         if (result.has_more) result.next_cursor = sign(job);
         else delete result.next_cursor;
@@ -780,8 +824,12 @@ export async function produceSource(
       throw validationError('record_cursor is only valid with view text.', {
         reason: 'invalid_selector',
       });
-    const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(45000)]);
-    await advance(job, normalized.stage ? stageMax : limit + 1, signal);
+    const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(WORK_BUDGET_MS)]);
+    const overlapCounts = await advance(job, normalized.stage ? stageMax : limit + 1, signal);
+    if (overlapCounts.unknown)
+      notices.push(
+        `Date overlap is unknown for ${overlapCounts.unknown} of ${overlapCounts.examined} source rows examined during this call; those rows were excluded. Counts do not describe unexamined source rows.`,
+      );
     if (
       table === 'ref_code_value' &&
       input.topic === 'contaminants' &&
@@ -789,52 +837,46 @@ export async function produceSource(
       !job.referenceExtrasAdded
     ) {
       const rows = ucmrReferenceProvider?.() ?? [];
-      job.pending.push(
-        ...rows.filter(
-          (row) =>
-            !input.query ||
-            Object.values(row).some(
-              (value) =>
-                typeof value === 'string' &&
-                value.toUpperCase().includes(String(input.query).toUpperCase()),
-            ),
-        ),
-      );
+      job.pending.push(...rows.filter((row) => matchesQuery(row, input.query)));
       job.referenceExtrasAdded = true;
     }
-    let staged: PublicRow[] | undefined;
-    if (normalized.stage) staged = job.pending.slice(0, stageMax);
-    const candidates = staged ?? job.pending;
+    const staged = normalized.stage ? job.pending.slice(0, stageMax) : undefined;
+    const candidates = (staged ?? job.pending).slice(0, limit);
+    if (candidates.length || outputPhase(job) !== 'membership')
+      result.selection_partition = {
+        selection_id: job.id,
+        partition: job.partition,
+        final_partition: null,
+      };
     job.step++;
-    for (const row of candidates.slice(0, limit)) {
-      result.items.push(row);
+    packItems(result.items, candidates, normalized.stage ? 20000 : INLINE_BUDGET_BYTES, () => {
       result.returned = result.items.length;
       result.has_more = true;
       result.next_cursor = sign(job);
-      if (wireBytes(result) >= (normalized.stage ? 20000 : 23000)) {
-        result.items.pop();
-        result.returned = result.items.length;
-        if (!result.items.length) {
-          job.text = { row, offset: 0 };
-          throw validationError('A complete source record exceeds the inline wire budget.', {
-            reason: 'item_too_large',
-            record_cursor: sign(job, 'text', 0),
-            source_cursor: sign(job),
-            follow_up: { tool, view: 'text', record_cursor: sign(job, 'text', 0) },
-          });
-        }
-        break;
-      }
+      return wireBytes(result);
+    });
+    result.returned = result.items.length;
+    const [first] = candidates;
+    if (!result.items.length && first) {
+      job.text = { row: first };
+      throw validationError('A complete source record exceeds the inline wire budget.', {
+        reason: 'item_too_large',
+        record_cursor: sign(job, 'text', 0),
+        source_cursor: sign(job),
+        follow_up: { tool, view: 'text', record_cursor: sign(job, 'text', 0) },
+      });
     }
     if (!staged) job.pending.splice(0, result.items.length);
-    result.phase = job.phase === 'inventory' || job.phase === 'geography' ? 'membership' : 'source';
+    result.phase = outputPhase(job);
     result.has_more = job.phase !== 'done' || job.pending.length > (staged?.length ?? 0);
+    if (result.selection_partition && !result.has_more)
+      result.selection_partition.final_partition = job.partition;
     result.source_complete = !result.has_more && job.deliveredRows === 0;
     result.truncated =
       result.has_more || (staged !== undefined && staged.length > result.items.length);
     if (result.has_more) result.next_cursor = sign(job);
     else delete result.next_cursor;
-    result.provenance = envelope(job, limit, notices).provenance;
+    result.provenance = provenance(job);
     if (staged && stageProducer) {
       const partitionOutput = { ...result, items: staged, returned: staged.length };
       try {
@@ -864,7 +906,7 @@ export async function produceSource(
       notices.push(
         'Retrieval is exhausted; earlier rows were delivered in previous outputs or staged partitions, so this output is not the entire selected source.',
       );
-    if (wireBytes(result) >= 24000)
+    if (wireBytes(result) >= RESPONSE_LIMIT_BYTES)
       throw serviceUnavailable(
         'Source envelope exceeds the response budget; narrow the selection.',
       );
@@ -874,6 +916,11 @@ export async function produceSource(
       result: structuredClone(result),
     };
     job.deliveredRows += staged?.length ?? result.items.length;
+    if (
+      result.selection_partition &&
+      (staged !== undefined || result.items.length || !result.has_more)
+    )
+      job.partition++;
     capacity();
     return result;
   } finally {

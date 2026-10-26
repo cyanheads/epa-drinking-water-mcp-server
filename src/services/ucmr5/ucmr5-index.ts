@@ -18,6 +18,12 @@ const CHUNK = 16384;
 const DAY_MS = 86400000;
 const INDEX_BUDGET = 512 * 1024 * 1024;
 type Cell = string | number | null;
+/** Occurrence column positions read directly by the scan. */
+const PWSID = occurrenceColumns.indexOf('pwsid');
+const COLLECTION_DATE = occurrenceColumns.indexOf('collection_date');
+const CONTAMINANT = occurrenceColumns.indexOf('contaminant');
+const RESULT_SIGN = occurrenceColumns.indexOf('analytical_results_sign');
+const RESULT_VALUE = occurrenceColumns.indexOf('analytical_result_value');
 
 /** Fail closed on an unsupported archive rather than dropping fields or rows. */
 export function datasetChanged(message: string, cause?: unknown): Error {
@@ -215,15 +221,13 @@ export class Ucmr5Index {
 
   /** Actual typed allocation sizes and conservative dictionary accounting, with row counts. */
   measurements() {
-    const relations = [this.occurrence, this.additional, this.zip];
-    const typedArrayBytes = relations.reduce(
-      (n, relation) => n + relation.measurements().typedArrayBytes,
-      0,
-    );
-    const dictionaryEstimatedBytes = relations.reduce(
-      (n, relation) => n + relation.measurements().dictionaryEstimatedBytes,
-      0,
-    );
+    let typedArrayBytes = 0;
+    let dictionaryEstimatedBytes = 0;
+    for (const relation of [this.occurrence, this.additional, this.zip]) {
+      const memory = relation.measurements();
+      typedArrayBytes += memory.typedArrayBytes;
+      dictionaryEstimatedBytes += memory.dictionaryEstimatedBytes;
+    }
     return {
       occurrenceRows: this.occurrence.count,
       additionalRows: this.additional.count,
@@ -266,9 +270,9 @@ export class Ucmr5Index {
         await setImmediate(undefined, { signal });
         signal.throwIfAborted();
       }
-      if (selection.pwsids && !selection.pwsids.has(String(this.occurrence.cell(position, 0))))
+      if (selection.pwsids && !selection.pwsids.has(String(this.occurrence.cell(position, PWSID))))
         continue;
-      const analyte = String(this.occurrence.cell(position, 13));
+      const analyte = String(this.occurrence.cell(position, CONTAMINANT));
       if (
         contaminant &&
         (contaminant === 'pfas'
@@ -278,10 +282,11 @@ export class Ucmr5Index {
         continue;
       if (
         selection.detectedOnly &&
-        (this.occurrence.cell(position, 17) !== '=' || this.occurrence.cell(position, 18) === null)
+        (this.occurrence.cell(position, RESULT_SIGN) !== '=' ||
+          this.occurrence.cell(position, RESULT_VALUE) === null)
       )
         continue;
-      const date = String(this.occurrence.cell(position, 11));
+      const date = String(this.occurrence.cell(position, COLLECTION_DATE));
       if (
         (selection.dateFrom && date < selection.dateFrom) ||
         (selection.dateTo && date > selection.dateTo)
@@ -342,7 +347,7 @@ export class Ucmr5Index {
   }
   /** Exact analyte spellings supplied by this archive revision. */
   contaminants(): string[] {
-    return [...(this.occurrence.columns[13]?.values ?? [])];
+    return [...(this.occurrence.columns[CONTAMINANT]?.values ?? [])];
   }
   /** Distinct system membership for a service ZIP, independent of occurrence cardinality. */
   zipPwsids(zip: string): ReadonlySet<string> {

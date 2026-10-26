@@ -15,15 +15,19 @@ import {
   type Table,
   tableSchemas,
 } from '@/domain/sdwis-contracts.js';
+import { hasUnsafeSegment } from '@/domain/source-inputs.js';
 
+const operators = [
+  'equals',
+  'contains',
+  'beginsWith',
+  'greaterThan',
+  'greaterThanEqual',
+  'in',
+] as const;
+const operatorSet = new Set<string>(operators);
 /** Verified DMAP predicate spellings. */
-export type Operator =
-  | 'equals'
-  | 'contains'
-  | 'beginsWith'
-  | 'greaterThan'
-  | 'greaterThanEqual'
-  | 'in';
+type Operator = (typeof operators)[number];
 /** One allowlisted column predicate; values are encoded as a single segment. */
 export interface Predicate {
   column: string;
@@ -62,25 +66,14 @@ async function wait(milliseconds: number, signal: AbortSignal): Promise<void> {
   });
 }
 /** Build paths only from fixed tables, projected columns and verified operators. */
-export function dmapUrl(table: Table, predicates: Predicate[], first: number, size: number): URL {
+function dmapUrl(table: Table, predicates: Predicate[], first: number, size: number): URL {
   const columns = new Set(Object.keys(tableSchemas[table].shape));
-  const operators = new Set<Operator>([
-    'equals',
-    'contains',
-    'beginsWith',
-    'greaterThan',
-    'greaterThanEqual',
-    'in',
-  ]);
   const paths = [`sdwis.${table}`];
   for (const [index, predicate] of predicates.entries()) {
     if (
       !columns.has(predicate.column) ||
-      !operators.has(predicate.operator) ||
-      /[/\\?#%]/.test(predicate.value) ||
-      Array.from(predicate.value).some(
-        (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
-      )
+      !operatorSet.has(predicate.operator) ||
+      hasUnsafeSegment(predicate.value)
     )
       throw validationError('Unsupported DMAP selector.', { reason: 'invalid_selector' });
     if (index) paths.push('and');
@@ -180,7 +173,7 @@ export async function readPage(
     } finally {
       active--;
     }
-    if (text && response) {
+    if (response?.ok) {
       let raw: unknown;
       try {
         raw = JSON.parse(text);

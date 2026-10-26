@@ -1,4 +1,7 @@
-/** @fileoverview Eagerly validated server-specific runtime configuration. */
+/**
+ * @fileoverview Eagerly validated server-specific runtime configuration.
+ * @module config/server-config
+ */
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 

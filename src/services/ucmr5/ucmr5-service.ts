@@ -34,6 +34,8 @@ function isTransient(cause: unknown): boolean {
     [408, 429, 500, 502, 503, 504].includes(Number(cause.data.status))
   );
 }
+/** Shared by the revalidation HEAD and the archive download. */
+const retryPolicy = { maxRetries: 2, baseDelayMs: 1000, maxDelayMs: 5000, isTransient };
 
 function waitFor<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
@@ -196,39 +198,24 @@ export class Ucmr5Service {
             });
           return response;
         },
-        {
-          maxRetries: 2,
-          baseDelayMs: 1000,
-          maxDelayMs: 5000,
-          deadlineMs: 45000,
-          signal,
-          isTransient,
-        },
+        { ...retryPolicy, deadlineMs: 45000, signal },
       );
+      // A 405/501 HEAD falls through to a full download and SHA-256 comparison.
       if (
         metadata.status === 304 ||
         (metadata.ok &&
-          ((this.revision.etag && metadata.headers.get('etag') === this.revision.etag) ||
-            (!this.revision.etag &&
-              this.revision.last_modified &&
-              metadata.headers.get('last-modified') === this.revision.last_modified)))
+          ((revision.etag && metadata.headers.get('etag') === revision.etag) ||
+            (!revision.etag &&
+              revision.last_modified &&
+              metadata.headers.get('last-modified') === revision.last_modified)))
       ) {
         this.checkedAt = Date.now();
         return;
       }
-      if (!metadata.ok && metadata.status !== 405 && metadata.status !== 501)
-        throw await httpErrorFromResponse(metadata, { service: 'EPA UCMR', captureBody: false });
     }
     const downloaded = await withRetry(
       ({ signal: attemptSignal }) => downloadArchive(this.fetcher, attemptSignal),
-      {
-        maxRetries: 2,
-        baseDelayMs: 1000,
-        maxDelayMs: 5000,
-        deadlineMs: LOAD_MS,
-        signal,
-        isTransient,
-      },
+      { ...retryPolicy, deadlineMs: LOAD_MS, signal },
     );
     try {
       if (this.index && this.revision?.archive_sha256 === downloaded.revision.archive_sha256) {
@@ -237,16 +224,12 @@ export class Ucmr5Service {
         return;
       }
       if (this.readers > 0) {
-        let resolveDrain: (() => void) | undefined;
-        const drained = new Promise<void>((resolve) => {
-          resolveDrain = resolve;
-          this.drained.push(resolve);
-        });
+        const drained = Promise.withResolvers<void>();
+        this.drained.push(drained.resolve);
         try {
-          await waitFor(drained, signal);
+          await waitFor(drained.promise, signal);
         } finally {
-          if (resolveDrain)
-            this.drained = this.drained.filter((resolve) => resolve !== resolveDrain);
+          this.drained = this.drained.filter((resolve) => resolve !== drained.resolve);
         }
       }
       signal.throwIfAborted();
@@ -278,14 +261,7 @@ export class Ucmr5Service {
   }
 }
 
-let service: Ucmr5Service | undefined;
 /** Initialize once during runtime setup; returns the instance for awaited teardown. */
 export function initUcmr5Service(options: { fetch?: typeof fetch } = {}): Ucmr5Service {
-  service = new Ucmr5Service(options);
-  return service;
-}
-/** Obtain the service initialized by runtime setup. */
-export function getUcmr5Service(): Ucmr5Service {
-  if (!service) throw new Error('UCMR service was not initialized.');
-  return service;
+  return new Ucmr5Service(options);
 }

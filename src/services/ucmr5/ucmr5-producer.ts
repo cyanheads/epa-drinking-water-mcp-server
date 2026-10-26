@@ -1,9 +1,20 @@
-/** @fileoverview Revision-bound UCMR occurrence pagination and atomic companion staging. */
+/**
+ * @fileoverview Revision-bound UCMR occurrence pagination and atomic companion staging.
+ * @module services/ucmr5/ucmr5-producer
+ */
 import { randomBytes } from 'node:crypto';
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { ColumnSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { conflict, rateLimited, validationError } from '@cyanheads/mcp-ts-core/errors';
-import { type SourceOutput, wireBytes } from '@/domain/source-output.js';
+import { selectionFilters } from '@/domain/source-inputs.js';
+import {
+  fitTextChunk,
+  INLINE_BUDGET_BYTES,
+  packItems,
+  RESPONSE_LIMIT_BYTES,
+  type SourceOutput,
+  wireBytes,
+} from '@/domain/source-output.js';
 import {
   additionalColumns,
   occurrenceColumns,
@@ -24,8 +35,10 @@ interface Job {
   membershipCursor?: string;
   membershipDone: boolean;
   offset: number;
+  partition: number;
   pending: Ucmr5Occurrence[];
   revision: string;
+  selectionId: string;
   step: number;
   touched: number;
 }
@@ -36,19 +49,21 @@ interface Pointer {
 }
 const caveat =
   'UCMR 5 is limited monitoring participation, not a census of water systems or a compliance verdict. Censored values remain unknown below their reporting limits; service ZIP is membership, not sample location.';
+/** Non-VARCHAR occurrence columns; every other relation column is text. */
+const columnTypes = new Map<string, ColumnSchema['type']>([
+  ['mrl', 'DOUBLE'],
+  ['analytical_result_value', 'DOUBLE'],
+  ['censored', 'BOOLEAN'],
+  ['collection_date', 'DATE'],
+]);
 const schema = (names: readonly string[]): ColumnSchema[] =>
   [...names, ...(names === occurrenceColumns ? ['censored'] : [])].map((name) => ({
     name,
     nullable: true,
-    type:
-      name === 'mrl' || name === 'analytical_result_value'
-        ? 'DOUBLE'
-        : name === 'censored'
-          ? 'BOOLEAN'
-          : name === 'collection_date'
-            ? 'DATE'
-            : 'VARCHAR',
+    type: columnTypes.get(name) ?? 'VARCHAR',
   }));
+/** Same length as a minted continuation key, so byte probes account for the final cursor. */
+const CURSOR_PLACEHOLDER = 'x'.repeat(32);
 
 /** Bind the archive service without eagerly downloading the national archive. */
 export function createUcmrProducer(
@@ -58,6 +73,10 @@ export function createUcmrProducer(
   const jobs = new Set<Job>();
   const pointers = new Map<string, Pointer>();
   const mint = (job: Job, rowOffset?: number, advance = false) => {
+    const step = job.step + (advance ? 1 : 0);
+    for (const [key, pointer] of pointers)
+      if (pointer.job === job && pointer.step === step && pointer.rowOffset === rowOffset)
+        return key;
     if (pointers.size >= 4096)
       throw rateLimited('UCMR continuation capacity is full; wait fifteen minutes.', {
         reason: 'selection_capacity_exhausted',
@@ -65,22 +84,21 @@ export function createUcmrProducer(
     const key = randomBytes(24).toString('base64url');
     pointers.set(key, {
       job,
-      step: job.step + (advance ? 1 : 0),
+      step,
       ...(rowOffset === undefined ? {} : { rowOffset }),
     });
     return key;
+  };
+  const advance = (job: Job) => {
+    job.step++;
+    for (const [key, pointer] of pointers)
+      if (pointer.job === job && pointer.step !== job.step) pointers.delete(key);
   };
   return async (input: UcmrInput, ctx: Context): Promise<SourceOutput> => {
     if (input.stage) getCanvasService();
     if (input.canvas_id && !input.stage)
       throw validationError('canvas_id requires stage true.', { reason: 'invalid_selector' });
-    const effective = { ...input };
-    delete effective.cursor;
-    delete effective.record_cursor;
-    delete effective.limit;
-    delete effective.view;
-    delete effective.canvas_id;
-    delete effective.stage_max_rows;
+    const effective = selectionFilters({ ...input });
     const filters = JSON.stringify(Object.entries(effective).sort());
     for (const job of jobs) if (!job.busy && Date.now() - job.touched >= 900000) jobs.delete(job);
     for (const [key, pointer] of pointers) if (!jobs.has(pointer.job)) pointers.delete(key);
@@ -111,6 +129,8 @@ export function createUcmrProducer(
           reason: 'selection_capacity_exhausted',
         });
       job = {
+        selectionId: randomBytes(18).toString('base64url'),
+        partition: 0,
         deliveredRows: 0,
         filters,
         revision: '',
@@ -126,6 +146,7 @@ export function createUcmrProducer(
       jobs.add(job);
     }
     const current = job;
+    current.touched = Date.now();
     current.busy = true;
     const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(180000)]);
     try {
@@ -173,19 +194,19 @@ export function createUcmrProducer(
             throw validationError('Oversized UCMR record expired.', { reason: 'cursor_invalid' });
           const points = Array.from(JSON.stringify(row));
           const start = pointer.rowOffset;
-          let end = start;
-          let upper = points.length;
+          result.selection_partition = {
+            selection_id: current.selectionId,
+            partition: current.partition,
+            final_partition: null,
+          };
           result.encoding = 'json';
           result.offset = start;
           result.record_identity = `${row.pwsid}:${row.sample_id}:${row.contaminant}`;
-          result.next_cursor = 'x'.repeat(32);
-          // Search code-point boundaries rather than rendering every growing prefix.
-          while (end < upper) {
-            const candidate = Math.ceil((end + upper) / 2);
+          result.next_cursor = CURSOR_PLACEHOLDER;
+          const end = fitTextChunk(points, start, (candidate) => {
             result.text = points.slice(start, candidate).join('');
-            if (wireBytes(result) < 23000) end = candidate;
-            else upper = candidate - 1;
-          }
+            return wireBytes(result);
+          });
           result.text = points.slice(start, end).join('');
           if (end === start && end < points.length)
             throw validationError('UCMR metadata exceeds inline capacity; narrow selection.', {
@@ -197,14 +218,17 @@ export function createUcmrProducer(
           } else {
             current.pending.shift();
             current.deliveredRows++;
+            current.partition++;
             result.has_more = current.pending.length > 0 || !current.exhausted;
+            if (!result.has_more)
+              result.selection_partition.final_partition = result.selection_partition.partition;
             if (result.has_more) result.next_cursor = mint(current, undefined, true);
             else delete result.next_cursor;
             result.notices.push(
               'Record text is complete; any next_cursor continues records with the original selectors and without record_cursor.',
             );
           }
-          current.step++;
+          advance(current);
           return result;
         }
         const workSignal = AbortSignal.any([signal, AbortSignal.timeout(45000)]);
@@ -228,7 +252,7 @@ export function createUcmrProducer(
           result.notices.push(
             'Follow next_cursor with the same selectors to finish reported legal-entity membership before occurrence retrieval.',
           );
-          current.step++;
+          advance(current);
           return result;
         }
         let pwsids: ReadonlySet<string> | undefined =
@@ -266,16 +290,22 @@ export function createUcmrProducer(
           current.exhausted = page.exhausted;
         }
         const staged = input.stage ? current.pending.slice(0, stageMax) : undefined;
+        result.selection_partition = {
+          selection_id: current.selectionId,
+          partition: current.partition,
+          final_partition: null,
+        };
         const candidates = staged ?? current.pending;
-        result.next_cursor = 'x'.repeat(32);
-        for (const row of candidates.slice(0, limit)) {
-          result.items.push(row);
-          result.returned = result.items.length;
-          if (wireBytes(result) >= (staged ? 19000 : 23000)) {
-            result.items.pop();
-            break;
-          }
-        }
+        result.next_cursor = CURSOR_PLACEHOLDER;
+        packItems(
+          result.items,
+          candidates.slice(0, limit),
+          staged ? 19000 : INLINE_BUDGET_BYTES,
+          () => {
+            result.returned = result.items.length;
+            return wireBytes(result);
+          },
+        );
         result.returned = result.items.length;
         if (!result.returned && candidates.length)
           throw validationError('A complete UCMR record exceeds inline capacity.', {
@@ -285,6 +315,7 @@ export function createUcmrProducer(
           });
         const consumed = staged?.length ?? result.items.length;
         result.has_more = !current.exhausted || current.pending.length > consumed;
+        if (!result.has_more) result.selection_partition.final_partition = current.partition;
         result.source_complete = !result.has_more && current.deliveredRows === 0;
         result.truncated = result.has_more || Boolean(staged && staged.length > result.returned);
         if (result.has_more) result.next_cursor = mint(current, undefined, true);
@@ -319,13 +350,14 @@ export function createUcmrProducer(
           result.notices.push(
             'Retrieval is exhausted; earlier rows were delivered in previous outputs or staged partitions, so this output is not the entire selected source.',
           );
-        if (wireBytes(result) >= 24000)
+        if (wireBytes(result) >= RESPONSE_LIMIT_BYTES)
           throw validationError('UCMR metadata exceeds inline capacity; narrow selection.', {
             reason: 'item_too_large',
           });
         current.pending.splice(0, consumed);
         current.deliveredRows += consumed;
-        current.step++;
+        if (consumed || !result.has_more) current.partition++;
+        advance(current);
         current.touched = Date.now();
         return result;
       } finally {

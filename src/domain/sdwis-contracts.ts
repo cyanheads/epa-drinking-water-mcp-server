@@ -125,18 +125,18 @@ export const tableSchemas = {
 export type Table = keyof typeof tableSchemas;
 /** Public JSON row; absence and source null remain distinct. */
 export type PublicRow = Record<string, string | number | boolean | null>;
+const sortKeys: Partial<Record<Table, readonly string[]>> = {
+  water_system: ['pwsid'],
+  violation: ['pwsid', 'violation_id'],
+  enforcement_action: ['pwsid', 'enforcement_id'],
+  lcr_sample: ['pwsid', 'sample_id'],
+  lcr_sample_result: ['pwsid', 'sample_id', 'sar_id'],
+  ref_code_value: ['value_type', 'value_code'],
+  treatment: ['pwsid', 'facility_id', 'treatment_id'],
+};
 /** Stable deterministic source sorting, with all projected columns for nonunique tables. */
-export function sortColumns(table: Table): string[] {
-  const keys: Partial<Record<Table, string[]>> = {
-    water_system: ['pwsid'],
-    violation: ['pwsid', 'violation_id'],
-    enforcement_action: ['pwsid', 'enforcement_id'],
-    lcr_sample: ['pwsid', 'sample_id'],
-    lcr_sample_result: ['pwsid', 'sample_id', 'sar_id'],
-    ref_code_value: ['value_type', 'value_code'],
-    treatment: ['pwsid', 'facility_id', 'treatment_id'],
-  };
-  return keys[table] ?? Object.keys(tableSchemas[table].shape);
+export function sortColumns(table: Table): readonly string[] {
+  return sortKeys[table] ?? Object.keys(tableSchemas[table].shape);
 }
 /** Parse a real ISO calendar date without timezone inference. */
 export function calendarDate(value: string): string {

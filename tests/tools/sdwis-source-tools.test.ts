@@ -60,6 +60,278 @@ const violationPath = /^\/dmapservice\/sdwis\.violation\//;
 const dictionaryPath = /^\/dmapservice\/sdwis\.ref_code_value\//;
 
 describe('SDWIS source tool wiring', () => {
+  it('returns an LCR membership checkpoint before fact I/O', async () => {
+    let stopped = false;
+    http = network([
+      {
+        path: waterPath,
+        response: (signal) =>
+          new Promise<Response>((_resolve, reject) =>
+            signal.addEventListener(
+              'abort',
+              () => {
+                stopped = true;
+                reject(signal.reason);
+              },
+              { once: true },
+            ),
+          ),
+      },
+    ]);
+    const result = data(
+      await paced(runToolContract(contaminants, { state: 'WA', dataset: 'lcr' })),
+    );
+    expect(result).toMatchObject({
+      phase: 'membership',
+      items: [],
+      returned: 0,
+      has_more: true,
+      source_complete: false,
+    });
+    expect(result.next_cursor).toEqual(expect.any(String));
+    expect(stopped).toBe(true);
+  });
+  it.each(['cancelled', 'intersection'])(
+    'preserves %s semantics at a county membership checkpoint',
+    async (mode) => {
+      const caller = new AbortController();
+      http = network([
+        { path: waterPath, rows: [{ pwsid: 'WA1234567', state_code: 'WA' }] },
+        {
+          path: /geographic_area\/county_served\/equals\/KING\//,
+          response: (signal) =>
+            new Promise<Response>((_resolve, reject) =>
+              signal.addEventListener(
+                'abort',
+                () => {
+                  if (mode === 'cancelled')
+                    caller.abort(new DOMException('caller stopped', 'AbortError'));
+                  reject(signal.reason);
+                },
+                { once: true },
+              ),
+            ),
+        },
+      ]);
+      const input = { state: 'WA', county: 'KING' };
+      const result = await paced(
+        runToolContract(violations, input, { context: { signal: caller.signal } }),
+      );
+      if (mode === 'cancelled') {
+        expect(result).toMatchObject({
+          isError: true,
+          structuredContent: { error: { code: -32011 } },
+        });
+        expect(JSON.stringify(result.content)).toContain('caller stopped');
+        return;
+      }
+      const first = data(result);
+      expect(first).toMatchObject({
+        phase: 'membership',
+        items: [],
+        has_more: true,
+        source_complete: false,
+      });
+      http.verify();
+      http = network([
+        {
+          path: /geographic_area\/county_served\/equals\/KING\//,
+          rows: [{ pwsid: 'OR1234567', county_served: 'KING', state_served: 'WA' }],
+        },
+      ]);
+      expect(
+        data(
+          await paced(runToolContract(violations, { ...input, cursor: String(first.next_cursor) })),
+        ),
+      ).toMatchObject({ items: [], has_more: false, source_complete: true });
+    },
+  );
+  it.each(['cancelled', 'upstream'])(
+    'preserves %s failure after committed membership instead of returning partial success',
+    async (mode) => {
+      const caller = new AbortController();
+      http = network([
+        {
+          path: waterPath,
+          rows: Array.from({ length: 1000 }, (_, i) => ({
+            pwsid: `WA${String(i).padStart(7, '0')}`,
+            state_code: 'WA',
+          })),
+        },
+        {
+          path: /\/1001:2000\/json$/,
+          response: () => {
+            if (mode === 'cancelled')
+              caller.abort(new DOMException('caller stopped', 'AbortError'));
+            return new Response(mode === 'upstream' ? 'forbidden' : '[]', {
+              status: mode === 'upstream' ? 403 : 200,
+            });
+          },
+        },
+      ]);
+      const result = await paced(
+        runToolContract(violations, { state: 'WA' }, { context: { signal: caller.signal } }),
+      );
+      expect(result).toMatchObject({ isError: true });
+      expect(result.structuredContent).toMatchObject({
+        error:
+          mode === 'cancelled' ? { code: -32011 } : { data: { status: 403, retryable: false } },
+      });
+      expect(JSON.stringify(result.content)).toContain(
+        mode === 'cancelled' ? 'caller stopped' : '403',
+      );
+      expect(http.calls).toHaveLength(2);
+    },
+  );
+  it('checkpoints slow membership at the last committed page, awaits its abort, and resumes without skipping', async () => {
+    const deadlines = vi.spyOn(AbortSignal, 'timeout').mockImplementation((milliseconds) => {
+      const controller = new AbortController();
+      setTimeout(
+        () => controller.abort(new DOMException('deadline', 'TimeoutError')),
+        milliseconds,
+      );
+      return controller.signal;
+    });
+    let aborted = false;
+    http = network([
+      ...Array.from({ length: 3 }, (_, page) => ({
+        path: new RegExp(
+          `/sdwis\\.water_system/state_code/equals/WA/sort/pwsid/${page * 1000 + 1}:${page * 1000 + 1000}/json$`,
+        ),
+        response: () =>
+          new Promise<Response>((resolve) =>
+            setTimeout(
+              () =>
+                resolve(
+                  Response.json(
+                    Array.from({ length: 1000 }, (_, i) => ({
+                      pwsid: `WA${String(page * 1000 + i).padStart(7, '0')}`,
+                      state_code: 'WA',
+                    })),
+                  ),
+                ),
+              10000,
+            ),
+          ),
+      })),
+      {
+        path: /\/3001:4000\/json$/,
+        response: (signal) =>
+          new Promise<Response>((_resolve, reject) =>
+            signal.addEventListener(
+              'abort',
+              () => {
+                aborted = true;
+                reject(signal.reason);
+              },
+              { once: true },
+            ),
+          ),
+      },
+      { path: /\/sdwis\.water_system\/.*\/3001:4000\/json$/, rows: [] },
+      {
+        path: violationPath,
+        rows: [
+          { pwsid: 'WA0000000', violation_id: 'first' },
+          { pwsid: 'WA0000001', violation_id: 'second' },
+        ],
+      },
+    ]);
+    try {
+      const input = { state: 'WA', limit: 1 };
+      const first = data(await paced(runToolContract(violations, input)));
+      expect(first).toMatchObject({
+        phase: 'membership',
+        items: [],
+        has_more: true,
+        source_complete: false,
+      });
+      expect(aborted).toBe(true);
+      expect(http.calls).toHaveLength(4);
+      const next = { ...input, cursor: String(first.next_cursor) };
+      error(await paced(runToolContract(violations, { ...next, state: 'OR' })), 'cursor_invalid');
+      const resumed = data(await paced(runToolContract(violations, next)));
+      expect(resumed).toMatchObject({
+        items: [{ violation_id: 'first' }],
+        has_more: true,
+        source_complete: false,
+      });
+      expect(data(await paced(runToolContract(violations, next)))).toEqual(resumed);
+      expect(http.calls).toHaveLength(6);
+    } finally {
+      deadlines.mockRestore();
+    }
+  });
+  it.each(['1030', '5000', '2A01'])('passes exact violation code %s unchanged', async (code) => {
+    http = network([
+      {
+        path: new RegExp(`/contaminant_code/equals/${code}/`),
+        rows: [{ pwsid: 'WA1234567', violation_id: 'exact', contaminant_code: code }],
+      },
+      { path: dictionaryPath, rows: [] },
+    ]);
+    expect(
+      data(await paced(runToolContract(violations, { pwsid: 'WA1234567', contaminant: code }))),
+    ).toMatchObject({
+      effective_filters: { contaminant: code },
+      items: [{ contaminant_code: code }],
+    });
+  });
+  it.each([
+    ['LeAd', 'PB90'],
+    ['CoPpEr', 'CU90'],
+  ])('retains the LCR alias %s as %s', async (alias, code) => {
+    http = network([
+      { path: /\/sdwis\.lcr_sample\//, rows: [] },
+      {
+        path: new RegExp(`/sdwis\\.lcr_sample_result/.*contaminant_code/equals/${code}/`),
+        rows: [{ pwsid: 'WA1234567', sample_id: 'S', contaminant_code: code }],
+      },
+      { path: dictionaryPath, rows: [] },
+    ]);
+    expect(
+      data(
+        await paced(
+          runToolContract(contaminants, { pwsid: 'WA1234567', dataset: 'lcr', contaminant: alias }),
+        ),
+      ),
+    ).toMatchObject({
+      effective_filters: { contaminant: code },
+      items: [{ contaminant_code: code }],
+    });
+  });
+  it.each(['violations', 'contaminants'])(
+    'uses both lead namespaces through %s without per-request validation',
+    async (name) => {
+      http = network([
+        {
+          path: /\/contaminant_code\/in\/1030%2C5000\//,
+          rows: [
+            { pwsid: 'WA1234567', violation_id: 'chemical', contaminant_code: '1030' },
+            { pwsid: 'WA1234567', violation_id: 'rule', contaminant_code: '5000' },
+          ],
+        },
+        {
+          path: /\/value_type\/equals\/CONTAMINANT_CODE\/and\/value_code\/in\/1030%2C5000\//,
+          rows: [],
+        },
+      ]);
+      const result = data(
+        await paced(
+          runToolContract(name === 'violations' ? violations : contaminants, {
+            pwsid: 'WA1234567',
+            contaminant: 'LeAd',
+            ...(name === 'contaminants' ? { dataset: 'violations' } : {}),
+          }),
+        ),
+      );
+      expect(result).toMatchObject({
+        effective_filters: { contaminant: '1030,5000' },
+        items: [{ contaminant_code: '1030' }, { contaminant_code: '5000' }],
+      });
+      expect(http.calls).toHaveLength(2);
+    },
+  );
   it('retains a failed stage cursor and keeps later partitions incomplete after retry', async () => {
     const { setStageProducer } = await import('../../src/services/sdwis/drinking-water-service.js');
     let fail = false;
@@ -85,6 +357,7 @@ describe('SDWIS source tool wiring', () => {
     ]);
     const input = { pwsid: 'WA1234567', stage: true, stage_max_rows: 1 };
     const first = data(await paced(runToolContract(violations, input)));
+    expect(first.selection_partition).toMatchObject({ partition: 0, final_partition: null });
     const next = { ...input, cursor: String(first.next_cursor) };
     fail = true;
     expect((await paced(runToolContract(violations, next))).isError).toBe(true);
@@ -95,6 +368,11 @@ describe('SDWIS source tool wiring', () => {
       has_more: false,
       source_complete: false,
       dataset: { row_count: 1, source_complete: false },
+      selection_partition: {
+        selection_id: (first.selection_partition as { selection_id: string }).selection_id,
+        partition: 1,
+        final_partition: 1,
+      },
     });
     expect(data(await paced(runToolContract(violations, next)))).toEqual(last);
   });
@@ -400,7 +678,7 @@ describe('SDWIS source tool wiring', () => {
         violation_category_label: null,
       }),
     ]);
-    expect(http.calls[0]).toContain('/contaminant_code/equals/1030/');
+    expect(http.calls[0]).toContain('/contaminant_code/in/1030%2C5000/');
   });
 
   it('joins LCR periods by system and sample, retaining unmatched results and null numbers', async () => {
@@ -562,6 +840,12 @@ describe('SDWIS source tool wiring', () => {
     const cursor = String(first.next_cursor);
     const secondResult = await paced(runToolContract(search, { state: 'WA', limit: 100, cursor }));
     const second = data(secondResult);
+    expect(first.selection_partition).toMatchObject({ partition: 0, final_partition: null });
+    expect(second.selection_partition).toEqual({
+      selection_id: (first.selection_partition as { selection_id: string }).selection_id,
+      partition: 1,
+      final_partition: 1,
+    });
     expect(second).toMatchObject({
       items: [{ pwsid: 'WA0000100' }, { pwsid: 'WA0000101' }, { pwsid: 'WA0000102' }],
       returned: 3,
