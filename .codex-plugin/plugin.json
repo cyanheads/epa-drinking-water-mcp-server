@@ -1,6 +1,6 @@
 {
   "name": "epa-drinking-water-mcp-server",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
