@@ -5,14 +5,14 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { dateFields, optionalText, pagingFields, requiredPwsid } from '@/domain/source-inputs.js';
+import { dateFields, geographyFields, optionalText, pagingFields } from '@/domain/source-inputs.js';
 import { formatSource, sourceOutputShape } from '@/domain/source-output.js';
 import { produceSource } from '@/services/sdwis/drinking-water-service.js';
 
 /** Read public enforcement source text and explicitly paged association rows. */
 export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
   description:
-    'Retrieve a public water system’s reported enforcement actions or their violation associations. section actions returns source action codes, originator, calendar date and untrusted source comments; it does not imply every record is a federal order or a monetary penalty. section associations pages composite PWSID/violation/action keys and reported snapshot-quarter fields separately. Date filters mean inclusive enforcement date and apply only to actions. Pass violation_id to select related actions through composite association joins. Set stage true for a bounded analytical partition.',
+    'Retrieve reported enforcement actions for a public water system or reported legal-entity state, optionally intersected with county served. Provide pwsid or state for actions. section actions returns source action codes, originator, calendar date and untrusted source comments; it does not imply every record is a federal order or monetary penalty. section associations and violation_id require pwsid and preserve any supplied geographic intersection. Associations page composite PWSID/violation/action keys and snapshot-quarter fields separately. Date filters mean inclusive enforcement date and apply only to actions. Set stage true for a bounded analytical partition.',
   annotations: {
     readOnlyHint: false,
     destructiveHint: false,
@@ -20,9 +20,7 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
     openWorldHint: true,
   },
   input: z.object({
-    pwsid: requiredPwsid.describe(
-      'Exact nine-character alphanumeric PWSID from sdwis_search_water_systems; unknown but shaped IDs return no matches.',
-    ),
+    ...geographyFields,
     section: z
       .enum(['actions', 'associations'])
       .default('actions')
@@ -73,7 +71,7 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
     {
       reason: 'invalid_selector',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Association section contains action-only selectors.',
+      when: 'PWSID/state is missing, associations or violation_id lack pwsid, or association section contains action-only selectors.',
       recovery:
         'Use sdwis_list_reference to check identifiers and dataset-specific selectors, then retry the source tool.',
     },
@@ -117,16 +115,12 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
       recovery:
         'Use the source tool without stage, or run the npm or Docker server with CANVAS_PROVIDER_TYPE=duckdb.',
     },
-    {
-      reason: 'item_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'One complete action/comment exceeds the inline wire budget.',
-      recovery:
-        'Repeat this tool with view text and the returned record_cursor to read the complete record in text chunks.',
-    },
   ],
   handler(input, ctx) {
+    if (!input.pwsid && !input.state)
+      throw ctx.fail('invalid_selector', 'Provide pwsid or state for actions.');
+    if (!input.pwsid && (input.section === 'associations' || input.violation_id))
+      throw ctx.fail('invalid_selector', 'section associations and violation_id require pwsid.');
     if (
       input.section === 'associations' &&
       (input.date_from || input.date_to || input.action_type || input.originator)

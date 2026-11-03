@@ -83,9 +83,43 @@ describe('SDWIS public contracts', () => {
     );
   });
   it('keeps system identity in fact sorts and all geographic tie breakers', () => {
+    expect(sortColumns('water_system_facility')).toEqual(['pwsid', 'facility_id']);
     expect(sortColumns('violation')).toEqual(['pwsid', 'violation_id']);
     expect(sortColumns('lcr_sample_result')).toEqual(['pwsid', 'sample_id', 'sar_id']);
     expect(sortColumns('geographic_area')).toContain('geo_id');
     expect(sortColumns('geographic_area')).toContain('state_served');
+  });
+  it('requires composite facility identities and allowlists all public facility fields', () => {
+    const row = {
+      pwsid: 'WA1234567',
+      facility_id: '0007',
+      facility_name: null,
+      state_facility_id: 'local',
+      facility_type_code: 'TP',
+      facility_activity_code: 'A',
+      facility_deactivation_date: null,
+      is_source_ind: 'N',
+      is_source_treated_ind: 'Y',
+      water_type_code: 'SW',
+      availability_code: 'P',
+      filtration_status_code: 'F',
+      seller_pwsid: null,
+      seller_pws_name: null,
+      seller_treatment_code: null,
+      submission_status_code: 'Y',
+    };
+    expect(
+      parseRows('water_system_facility', [
+        { ...row, contact: 'CONTACT-CANARY', pws_name: 'Not a facility field' },
+      ]),
+    ).toEqual([row]);
+    for (const input of [
+      { pwsid: 'WA1234567' },
+      { pwsid: 'WA1234567', facility_id: '' },
+      { facility_id: '0007' },
+    ])
+      expect(() => parseRows('water_system_facility', [input])).toThrow(
+        expect.objectContaining({ data: { reason: 'upstream_contract_changed' } }),
+      );
   });
 });

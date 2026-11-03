@@ -4,7 +4,7 @@
  */
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { type SourceOutput, wireBytes } from '../../src/domain/source-output.js';
+import type { SourceOutput } from '../../src/domain/source-output.js';
 import { searchContaminantsTool as tool } from '../../src/mcp-server/tools/definitions/search-contaminants.tool.js';
 import {
   getCanvasService,
@@ -31,7 +31,6 @@ function data(result: Awaited<ReturnType<typeof runToolContract>>): SourceOutput
   expect(result.isError, JSON.stringify(result)).not.toBe(true);
   expectParity(result);
   const parsed = tool.output.parse(result.structuredContent);
-  expect(wireBytes(parsed)).toBeLessThan(24000);
   return parsed;
 }
 function error(result: Awaited<ReturnType<typeof runToolContract>>, reason: string) {
@@ -47,10 +46,154 @@ afterEach(async () => {
   canvas = undefined;
   initCanvasService(undefined, 25000);
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.useRealTimers();
 });
 
 describe('real UCMR producer through tool contract', () => {
+  it('preserves PWSID and ZIP intersections without SDWIS requests', async () => {
+    const dmap = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', dmap);
+    install([occurrence(), occurrence({ PWSID: 'OR1234567', SampleID: 'other' })]);
+    expect(data(await runToolContract(tool, { ...scope, zip: '98101' }))).toMatchObject({
+      items: [{ pwsid: 'WA1234567' }],
+      has_more: false,
+      source_complete: true,
+    });
+    expect(
+      data(await runToolContract(tool, { ...scope, pwsid: 'WA9999999', zip: '98101' })),
+    ).toMatchObject({
+      items: [],
+      has_more: false,
+      source_complete: true,
+    });
+    expect(dmap).not.toHaveBeenCalled();
+  });
+
+  it('pages ZIP-only occurrences without SDWIS requests and preserves empty ZIP selections', async () => {
+    const dmap = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', dmap);
+    install([occurrence(), occurrence({ PWSID: 'OR1234567', SampleID: 'other' })]);
+    const input = { dataset: 'ucmr5', zip: '98101', limit: 1 } as const;
+    const first = data(await runToolContract(tool, input));
+    expect(first).toMatchObject({
+      items: [{ pwsid: 'WA1234567' }],
+      effective_filters: { zip: '98101' },
+      has_more: true,
+      source_complete: false,
+    });
+    error(
+      await runToolContract(tool, { ...input, zip: '98102', cursor: first.next_cursor }),
+      'cursor_invalid',
+    );
+    const last = data(await runToolContract(tool, { ...input, cursor: first.next_cursor }));
+    expect(last).toMatchObject({
+      items: [{ pwsid: 'OR1234567' }],
+      has_more: false,
+      source_complete: false,
+    });
+    expect(data(await runToolContract(tool, { dataset: 'ucmr5', zip: '00000' }))).toMatchObject({
+      items: [],
+      returned: 0,
+      has_more: false,
+      source_complete: true,
+    });
+    expect(dmap).not.toHaveBeenCalled();
+  });
+
+  it('returns 500 whole occurrence rows and clamps 501 without shortening pages for bytes', async () => {
+    const name = 'µ <water> [district](https://example.org) "\\'.repeat(12);
+    install(
+      Array.from({ length: 1001 }, (_, i) => occurrence({ SampleID: `S${i}`, PWSName: name })),
+    );
+    const first = data(await runToolContract(tool, { ...scope, limit: 500 }));
+    expect(first).toMatchObject({
+      returned: 500,
+      limit: 500,
+      has_more: true,
+      source_complete: false,
+    });
+    expect(first.items.map((row) => row.sample_id)).toEqual(
+      Array.from({ length: 500 }, (_, i) => `S${i}`),
+    );
+    expect(first.items.every((row) => row.pws_name === name)).toBe(true);
+    const second = data(
+      await runToolContract(tool, { ...scope, limit: 501, cursor: first.next_cursor }),
+    );
+    expect(second).toMatchObject({
+      returned: 500,
+      limit: 500,
+      has_more: true,
+      source_complete: false,
+    });
+    expect(second.items.map((row) => row.sample_id)).toEqual(
+      Array.from({ length: 500 }, (_, i) => `S${i + 500}`),
+    );
+    expect(second.notices.join(' ')).toContain('clamped to 500');
+    const last = data(await runToolContract(tool, { ...scope, cursor: second.next_cursor }));
+    expect(last).toMatchObject({
+      items: [{ sample_id: 'S1000' }],
+      returned: 1,
+      has_more: false,
+      source_complete: false,
+    });
+  });
+
+  it('previews 500 whole staged rows and advances past the entire atomic partition', async () => {
+    canvas = fixture();
+    initCanvasService(canvas.canvas, 25000);
+    install(Array.from({ length: 502 }, (_, i) => occurrence({ SampleID: `S${i}` })));
+    const input = { ...scope, stage: true, limit: 501, stage_max_rows: 501 };
+    const first = data(await runToolContract(tool, input));
+    expect(first).toMatchObject({
+      returned: 500,
+      limit: 500,
+      truncated: true,
+      has_more: true,
+      source_complete: false,
+      dataset: { row_count: 501 },
+    });
+    expect(first.items[499]?.sample_id).toBe('S499');
+    const last = data(
+      await runToolContract(tool, {
+        ...input,
+        canvas_id: first.dataset!.canvas_id,
+        cursor: first.next_cursor,
+      }),
+    );
+    expect(last).toMatchObject({
+      items: [{ sample_id: 'S501' }],
+      returned: 1,
+      has_more: false,
+      source_complete: false,
+      dataset: { row_count: 1 },
+    });
+    const instance = await canvas.canvas.acquire(first.dataset!.canvas_id, canvas.ctx);
+    expect(
+      (
+        await instance.query(
+          `SELECT sample_id FROM ${first.dataset!.table_name} WHERE sample_id = 'S500'`,
+        )
+      ).rows,
+    ).toEqual([{ sample_id: 'S500' }]);
+  });
+
+  it('rejects missing, malformed and wrong-dataset ZIP scopes before upstream I/O', async () => {
+    const dmap = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', dmap);
+    const archiveFetch = vi.fn<typeof fetch>(async () => new Response(archive()));
+    install([], archiveFetch);
+    for (const input of [
+      { dataset: 'ucmr5' },
+      { dataset: 'ucmr5', zip: '9810' },
+      { dataset: 'ucmr5', zip: '98101', county: 'King' },
+      { dataset: 'violations', pwsid: 'WA1234567', zip: '98101' },
+      { dataset: 'lcr', pwsid: 'WA1234567', zip: '98101' },
+    ] as const)
+      error(await runToolContract(tool, input), 'invalid_selector');
+    expect(dmap).not.toHaveBeenCalled();
+    expect(archiveFetch).not.toHaveBeenCalled();
+  });
   it('keeps identical-filter interleaved retrieval identities distinct and represents an exhausted empty selection atomically', async () => {
     canvas = fixture();
     initCanvasService(canvas.canvas, 25000);
@@ -99,31 +242,23 @@ describe('real UCMR producer through tool contract', () => {
       },
     ]);
   });
-  it('leaves a source partition gap when an oversized staged record is delivered as text', async () => {
+  it('stages large whole rows without leaving a source partition gap', async () => {
     canvas = fixture();
     initCanvasService(canvas.canvas, 25000);
     install([occurrence({ PWSName: 'x'.repeat(80000) }), occurrence({ SampleID: 'next' })]);
     const input = { ...scope, stage: true, stage_max_rows: 1 };
-    const first = await runToolContract(tool, input);
-    error(first, 'item_too_large');
-    const details = first.structuredContent as { error: { data: { record_cursor: string } } };
-    let record_cursor: string | undefined = details.error.data.record_cursor;
-    let sourceCursor: string | undefined;
-    let selectionId: string | undefined;
-    do {
-      const text = data(await runToolContract(tool, { ...input, view: 'text', record_cursor }));
-      selectionId ??= text.selection_partition?.selection_id;
-      expect(text.selection_partition).toMatchObject({ selection_id: selectionId, partition: 0 });
-      if (text.notices.some((notice) => notice.includes('Record text is complete'))) {
-        sourceCursor = text.next_cursor;
-        break;
-      }
-      record_cursor = text.next_cursor;
-    } while (record_cursor);
-    expect(sourceCursor).toBeDefined();
-    const staged = data(await runToolContract(tool, { ...input, cursor: sourceCursor }));
+    const first = data(await runToolContract(tool, input));
+    expect(first.items[0]?.pws_name).toBe('x'.repeat(80000));
+    expect(first.selection_partition).toMatchObject({ partition: 0, final_partition: null });
+    const staged = data(
+      await runToolContract(tool, {
+        ...input,
+        canvas_id: first.dataset!.canvas_id,
+        cursor: first.next_cursor,
+      }),
+    );
     expect(staged.selection_partition).toEqual({
-      selection_id: selectionId,
+      selection_id: first.selection_partition?.selection_id,
       partition: 1,
       final_partition: 1,
     });
@@ -133,7 +268,9 @@ describe('real UCMR producer through tool contract', () => {
         canvas.ctx,
       ),
     ).toMatchObject({
-      selection_coverage: [{ partitions_present: [1], final_partition: 1, chain_complete: false }],
+      selection_coverage: [
+        { partitions_present: [0, 1], final_partition: 1, chain_complete: true },
+      ],
     });
   });
   it('refreshes ordinary record activity and preserves the final source completeness distinction', async () => {
@@ -201,31 +338,28 @@ describe('real UCMR producer through tool contract', () => {
     expect(cursor).toBeUndefined();
     console.info('4098 real UCMR positions:', { elapsedMs: performance.now() - started });
   });
-  it('reuses oversized retry positions and refreshes retry and text idle activity', async () => {
+  it('refreshes large whole-row continuation activity and expires idle positions', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    install([occurrence({ PWSName: 'x'.repeat(80000) }), occurrence({ SampleID: 'next' })]);
-    const first = await runToolContract(tool, { ...scope, limit: 1 });
-    error(first, 'item_too_large');
-    const details = first.structuredContent as { error: { data: { record_cursor: string } } };
-    const record_cursor = details.error.data.record_cursor;
-    vi.setSystemTime(Date.now() + 600000);
-    const retry = await runToolContract(tool, { ...scope, limit: 1, cursor: record_cursor });
-    error(retry, 'item_too_large');
-    expect(retry.structuredContent).toMatchObject({ error: { data: { record_cursor } } });
-    vi.setSystemTime(Date.now() + 600000);
-    const text = data(await runToolContract(tool, { ...scope, view: 'text', record_cursor }));
-    expect(text.offset).toBe(0);
-    vi.setSystemTime(Date.now() + 600000);
-    const next = data(
-      await runToolContract(tool, { ...scope, view: 'text', record_cursor: text.next_cursor }),
+    install(
+      Array.from({ length: 4 }, (_, i) =>
+        occurrence({ SampleID: String(i), PWSName: 'x'.repeat(80000) }),
+      ),
     );
-    expect(next.offset).toBe(Array.from(text.text ?? '').length);
-    error(await runToolContract(tool, { ...scope, view: 'text', record_cursor }), 'cursor_invalid');
+    const first = data(await runToolContract(tool, { ...scope, limit: 1 }));
+    expect(first.items[0]?.pws_name).toBe('x'.repeat(80000));
+    vi.setSystemTime(Date.now() + 600000);
+    const second = data(
+      await runToolContract(tool, { ...scope, limit: 1, cursor: first.next_cursor }),
+    );
+    expect(second.items[0]?.sample_id).toBe('1');
+    vi.setSystemTime(Date.now() + 600000);
+    const third = data(
+      await runToolContract(tool, { ...scope, limit: 1, cursor: second.next_cursor }),
+    );
+    expect(third.items[0]?.sample_id).toBe('2');
+    error(await runToolContract(tool, { ...scope, cursor: first.next_cursor }), 'cursor_invalid');
     vi.setSystemTime(Date.now() + 900001);
-    error(
-      await runToolContract(tool, { ...scope, view: 'text', record_cursor: next.next_cursor }),
-      'cursor_invalid',
-    );
+    error(await runToolContract(tool, { ...scope, cursor: third.next_cursor }), 'cursor_invalid');
   });
   it('resumes UCMR membership after an awaited deadline checkpoint', async () => {
     // Keep this artificial deadline from carrying DMAP pacing state into other archive tests.
@@ -463,98 +597,96 @@ describe('real UCMR producer through tool contract', () => {
     error(await runToolContract(tool, { ...scope, cursor: fresh.next_cursor }), 'cursor_invalid');
   });
 
-  it('retains the whole byte-crossing row for the next continuation', async () => {
+  it('retains whole large rows at exact row-count continuation boundaries', async () => {
     install(
       Array.from({ length: 4 }, (_, i) =>
         occurrence({ SampleID: `S${i}`, PWSName: `${i}:${'µ'.repeat(1600)}` }),
       ),
     );
-    let page = data(await runToolContract(tool, { ...scope, limit: 100 }));
-    expect(page.returned).toBeLessThan(4);
+    let page = data(await runToolContract(tool, { ...scope, limit: 2 }));
+    expect(page.returned).toBe(2);
     const ids: unknown[] = [];
     for (let i = 0; i < 6; i++) {
       ids.push(...page.items.map((row) => row.sample_id));
       if (!page.has_more) break;
-      page = data(await runToolContract(tool, { ...scope, limit: 100, cursor: page.next_cursor }));
+      page = data(await runToolContract(tool, { ...scope, limit: 2, cursor: page.next_cursor }));
     }
     expect(ids).toEqual(['S0', 'S1', 'S2', 'S3']);
     expect(page.source_complete).toBe(false);
   });
 
-  it('reassembles an oversized record losslessly then resumes ordinary rows', async () => {
+  it('returns an oversized Unicode and markup row whole then resumes ordinary rows', async () => {
     const name = 'µ"\\'.repeat(2500);
     install([occurrence({ PWSName: name }), occurrence({ SampleID: 'next' })]);
-    const oversized = await runToolContract(tool, { ...scope, limit: 2 });
-    error(oversized, 'item_too_large');
-    const details = oversized.structuredContent as { error: { data: { record_cursor: string } } };
-    let cursor = details.error.data.record_cursor;
-    let text = '';
-    let recordNext: string | undefined;
-    for (let i = 0; i < 20; i++) {
-      const page = data(
-        await runToolContract(tool, { ...scope, view: 'text', record_cursor: cursor }),
-      );
-      expect(page.offset).toBe(Array.from(text).length);
-      text += page.text;
-      if (page.notices.some((notice) => notice.includes('Record text is complete'))) {
-        recordNext = page.next_cursor;
-        break;
-      }
-      cursor = String(page.next_cursor);
-    }
-    expect(JSON.parse(text)).toMatchObject({
+    const first = data(await runToolContract(tool, { ...scope, limit: 1 }));
+    expect(first.items[0]).toMatchObject({
       pws_name: name,
       sample_id: 'S1',
       analytical_result_value: null,
     });
-    expect(recordNext).toBeDefined();
-    expect(data(await runToolContract(tool, { ...scope, cursor: recordNext }))).toMatchObject({
+    expect(first.next_cursor).toBeDefined();
+    expect(
+      data(await runToolContract(tool, { ...scope, cursor: first.next_cursor })),
+    ).toMatchObject({
       items: [{ sample_id: 'next' }],
       source_complete: false,
     });
   });
 
-  it('intersects reported state/county inventory with ZIP memberships rather than source-state labels', async () => {
-    const service = install([
-      occurrence({ State: 'OR' }),
-      occurrence({ PWSID: 'OR1234567', SampleID: 'other', State: 'WA' }),
-    ]);
-    (await service.acquire(new AbortController().signal)).release();
-    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
-    const http = network([
-      {
-        path: /water_system\/state_code\/equals\/WA\//,
-        rows: [
-          { pwsid: 'WA1234567', state_code: 'WA' },
-          { pwsid: 'OR1234567', state_code: 'WA' },
-        ],
-      },
-      {
-        path: /geographic_area\/county_served\/equals\/KING\//,
-        rows: [{ pwsid: 'WA1234567', county_served: 'KING' }],
-      },
-    ]);
-    const result = data(
-      await paced(
-        runToolContract(tool, {
-          dataset: 'ucmr5',
-          state: 'Washington',
-          county: 'King County',
-          zip: '98101',
-        }),
-      ),
-    );
-    expect(result).toMatchObject({
-      items: [{ pwsid: 'WA1234567', state: 'OR' }],
-      effective_filters: { state: 'WA', county: 'KING', state_basis: 'reported_legal_entity' },
-      source_complete: true,
-    });
-    http.verify();
-    expect(data(await runToolContract(tool, { ...scope, zip: '99999' }))).toMatchObject({
-      items: [],
-      source_complete: true,
-    });
-  });
+  it.each(['King', 'St. Clair'])(
+    'intersects reported state/county %s inventory with ZIP memberships rather than source-state labels',
+    async (county) => {
+      const service = install([
+        occurrence({ State: 'OR' }),
+        occurrence({ PWSID: 'OR1234567', SampleID: 'other', State: 'WA' }),
+      ]);
+      (await service.acquire(new AbortController().signal)).release();
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const http = network([
+        {
+          path: /water_system\/state_code\/equals\/WA\//,
+          rows: [
+            { pwsid: 'WA1234567', state_code: 'WA' },
+            { pwsid: 'OR1234567', state_code: 'WA' },
+          ],
+        },
+        {
+          path:
+            county === 'King'
+              ? /geographic_area\/county_served\/equals\/KING\//
+              : /geographic_area\/county_served\/beginsWith\/ST\//,
+          rows: [
+            ...(county === 'King' ? [] : [{ pwsid: 'OR1234567', county_served: 'STEVENS' }]),
+            { pwsid: 'WA1234567', county_served: county.toUpperCase() },
+          ],
+        },
+      ]);
+      const result = data(
+        await paced(
+          runToolContract(tool, {
+            dataset: 'ucmr5',
+            state: 'Washington',
+            county: `${county} County`,
+            zip: '98101',
+          }),
+        ),
+      );
+      expect(result).toMatchObject({
+        items: [{ pwsid: 'WA1234567', state: 'OR' }],
+        effective_filters: {
+          state: 'WA',
+          county: county.toUpperCase(),
+          state_basis: 'reported_legal_entity',
+        },
+        source_complete: true,
+      });
+      http.verify();
+      expect(data(await runToolContract(tool, { ...scope, zip: '99999' }))).toMatchObject({
+        items: [],
+        source_complete: true,
+      });
+    },
+  );
 
   it('detects a changed publication after a continuously active selection crosses refresh time', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
@@ -627,13 +759,20 @@ describe('real UCMR producer through tool contract', () => {
     install([], fetcher);
     error(await runToolContract(tool, { ...scope, zip: '9810' }), 'invalid_selector');
     error(await runToolContract(tool, { ...scope, stage: true }), 'canvas_disabled');
-    error(await runToolContract(tool, { ...scope, view: 'text' }), 'cursor_invalid');
+    for (const legacy of [{ view: 'text' }, { view: 'records' }, { record_cursor: 'obsolete' }]) {
+      const rejected = await runToolContract(tool, { ...scope, ...legacy });
+      expect(rejected).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: -32602 } },
+      });
+      expect(JSON.stringify(rejected.content)).toContain('Unrecognized key');
+    }
     expect(fetcher).not.toHaveBeenCalled();
     const result = data(
-      await runToolContract(tool, { ...scope, limit: 101, stage_max_rows: 25001 }),
+      await runToolContract(tool, { ...scope, limit: 501, stage_max_rows: 25001 }),
     );
-    expect(result.limit).toBe(100);
-    expect(result.notices.join(' ')).toContain('clamped to 100');
+    expect(result.limit).toBe(500);
+    expect(result.notices.join(' ')).toContain('clamped to 500');
     expect(result.notices.join(' ')).toContain('clamped to 25000');
   });
 
@@ -690,7 +829,7 @@ describe('real UCMR producer through tool contract', () => {
     expect(additional).toBeDefined();
     expect(zip).toBeDefined();
     const query = (sql: string) =>
-      service.query({ canvas_id: handle.canvas_id, sql, view: 'records', limit: 100 }, canvas!.ctx);
+      service.query({ canvas_id: handle.canvas_id, sql, limit: 100 }, canvas!.ctx);
     expect(
       (
         await query(
@@ -778,5 +917,39 @@ describe('real UCMR producer through tool contract', () => {
     expect((await instance.query(`SELECT sample_id FROM ${handle.table_name}`)).rows).toEqual([
       { sample_id: 'S1' },
     ]);
+  });
+
+  it('enforces strict 500-row validation on both tool response surfaces', async () => {
+    vi.resetModules();
+    vi.stubEnv('SDWIS_CLAMP_LIMITS', 'false');
+    const { searchContaminantsTool: strictTool } = await import(
+      '../../src/mcp-server/tools/definitions/search-contaminants.tool.js'
+    );
+    const { setUcmrProducer: bind } = await import(
+      '../../src/services/sdwis/drinking-water-service.js'
+    );
+    const { createUcmrProducer: producer } = await import(
+      '../../src/services/ucmr5/ucmr5-producer.js'
+    );
+    const service = install(
+      Array.from({ length: 500 }, (_, i) => occurrence({ SampleID: String(i) })),
+    );
+    bind(producer(service));
+    const exact = await runToolContract(strictTool, { ...scope, limit: 500 });
+    expectParity(exact);
+    expect(exact.structuredContent).toMatchObject({
+      returned: 500,
+      limit: 500,
+      has_more: false,
+      source_complete: true,
+    });
+    for (const invalid of [501, 0, -1, 1.5]) {
+      const rejected = await runToolContract(strictTool, { ...scope, limit: invalid });
+      expect(rejected).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: -32602 } },
+      });
+      expect(JSON.stringify(rejected.content)).toContain('limit');
+    }
   });
 });

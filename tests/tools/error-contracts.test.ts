@@ -161,9 +161,7 @@ describe('canvas error recovery', () => {
     const h = await stage();
     // All calls enter the real reservation queue before native DuckDB completes the first query.
     const pending = Array.from({ length: 5 }, () =>
-      d
-        .getCanvasService()
-        .query({ canvas_id: h.canvas_id, sql: 'SELECT 1', view: 'records', limit: 10 }, f.ctx),
+      d.getCanvasService().query({ canvas_id: h.canvas_id, sql: 'SELECT 1', limit: 10 }, f.ctx),
     );
     const results = Promise.allSettled(pending);
     for (const [tool, args] of [

@@ -4,6 +4,7 @@
  */
 import { z } from '@cyanheads/mcp-ts-core';
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
+import { inlineLimit } from './inline-limit.js';
 import { calendarDate } from './sdwis-contracts.js';
 
 /** Unicode uppercasing can expand raw characters into ASCII; normalized length remains runtime-validated. */
@@ -32,21 +33,7 @@ export const pagingFields = {
   cursor: optionalText(
     'Opaque continuation from this tool; retain exactly the original selectors.',
   ),
-  limit: z
-    .number()
-    .int()
-    .positive()
-    .default(10)
-    .describe(
-      'Inline items requested; values above the effective maximum 100 are clamped with a notice.',
-    ),
-  view: z
-    .enum(['records', 'text'])
-    .default('records')
-    .describe('Records by default; text reads an oversized record losslessly using record_cursor.'),
-  record_cursor: optionalText(
-    'Signed oversized-record pointer returned by this same tool; use with view text.',
-  ),
+  limit: inlineLimit,
 };
 /** Geographic membership selectors, resolved before querying fact tables. */
 export const geographyFields = {
@@ -85,28 +72,24 @@ function normalizeState(value: string): string {
   if (!state) throw validationError('Unknown state or territory.', { reason: 'invalid_selector' });
   return state;
 }
-/** True when a value could escape its single DMAP path segment: path syntax or control characters. */
-export function hasUnsafeSegment(value: string): boolean {
-  return (
-    /[/\\?#%]/.test(value) ||
-    Array.from(value).some(
-      (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
-    )
-  );
-}
-/** The selection a continuation binds: every input except paging, view and capability fields. */
+/** The selection a continuation binds: every input except paging and capability fields. */
 export function selectionFilters(input: Record<string, unknown>): Record<string, unknown> {
   const result = { ...input };
-  for (const name of ['cursor', 'record_cursor', 'view', 'limit', 'stage_max_rows', 'canvas_id'])
-    delete result[name];
+  for (const name of ['cursor', 'limit', 'stage_max_rows', 'canvas_id']) delete result[name];
   return result;
 }
-/** Normalize selector strings without accepting path syntax or control characters. */
+/** Normalize selectors; literal name, county, facility-ID and action-code punctuation is filtered locally. */
 export function normalizeSelectors(input: Record<string, unknown>): Record<string, unknown> {
   const result = { ...input };
   for (const [key, value] of Object.entries(result))
     if (typeof value === 'string') {
-      if (hasUnsafeSegment(value))
+      if (
+        Array.from(value).some(
+          (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+        ) ||
+        (!['name_contains', 'county', 'action_type', 'facility_id'].includes(key) &&
+          /[/\\?#%]/.test(value))
+      )
         throw validationError('Selector contains path or control characters.', {
           reason: 'invalid_selector',
         });

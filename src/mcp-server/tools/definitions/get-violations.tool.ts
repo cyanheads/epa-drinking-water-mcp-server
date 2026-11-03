@@ -50,7 +50,7 @@ export const getViolationsTool = tool('sdwis_get_violations', {
       .positive()
       .default(5000)
       .describe(
-        'Partition row request; above 25000 is clamped with a notice. Twenty upstream pages per call still bound acquisition.',
+        'Partition row request; above 25000 is clamped with a notice. Bounded upstream work per call still limits acquisition.',
       ),
   }),
   output: z.object(sourceOutputShape),
@@ -127,14 +127,6 @@ export const getViolationsTool = tool('sdwis_get_violations', {
       when: 'Staging was requested without a real configured canvas.',
       recovery:
         'Use the source tool without stage, or run the npm or Docker server with CANVAS_PROVIDER_TYPE=duckdb.',
-    },
-    {
-      reason: 'item_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'A complete row exceeds the inline response budget.',
-      recovery:
-        'Repeat this tool with view text and the returned record_cursor to read the complete record in text chunks.',
     },
   ],
   handler(input, ctx) {

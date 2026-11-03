@@ -15,7 +15,6 @@ import {
   type Table,
   tableSchemas,
 } from '@/domain/sdwis-contracts.js';
-import { hasUnsafeSegment } from '@/domain/source-inputs.js';
 
 const operators = [
   'equals',
@@ -46,6 +45,66 @@ const origin = 'https://data.epa.gov';
 let nextStart = 0;
 let active = 0;
 
+/** DMAP parses decoded values; substring operators also interpret underscores as wildcards. */
+function safeCharacter(code: number, operator: Operator): boolean {
+  return (
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    (code >= 48 && code <= 57) ||
+    code === 32 ||
+    code === 45 ||
+    (code === 95 && (operator === 'equals' || operator === 'in')) ||
+    (code === 44 && operator === 'in')
+  );
+}
+function safeValue(value: string, operator: Operator): boolean {
+  for (let i = 0; i < value.length; i++)
+    if (!safeCharacter(value.charCodeAt(i), operator)) return false;
+  return true;
+}
+/** Reduce literal predicates to grammar-safe supersets; callers must still match full predicates. */
+export function pushdownPredicates(predicates: Predicate[]): Predicate[] {
+  return predicates.flatMap((predicate) => {
+    if (safeValue(predicate.value, predicate.operator)) return [predicate];
+    if (predicate.operator === 'contains') {
+      let start = 0;
+      let end = 0;
+      let bestStart = 0;
+      let bestEnd = 0;
+      for (let i = 0; i < predicate.value.length; i++) {
+        const code = predicate.value.charCodeAt(i);
+        if (!safeCharacter(code, 'contains')) {
+          start = i + 1;
+          end = start;
+        } else if (code !== 32) {
+          end = i + 1;
+          if (end - start > bestEnd - bestStart) {
+            bestStart = start;
+            bestEnd = end;
+          }
+        } else if (start === end) {
+          start = i + 1;
+          end = start;
+        }
+      }
+      return bestEnd > bestStart
+        ? [{ ...predicate, value: predicate.value.slice(bestStart, bestEnd) }]
+        : [];
+    }
+    if (predicate.operator === 'equals' || predicate.operator === 'beginsWith') {
+      let end = 0;
+      while (
+        end < predicate.value.length &&
+        safeCharacter(predicate.value.charCodeAt(end), 'beginsWith')
+      )
+        end++;
+      const value = predicate.value.slice(0, end).trimEnd();
+      return value ? [{ ...predicate, operator: 'beginsWith' as const, value }] : [];
+    }
+    return [];
+  });
+}
+
 /** Abort-aware wait used by both admission and bounded retries. */
 async function wait(milliseconds: number, signal: AbortSignal): Promise<void> {
   signal.throwIfAborted();
@@ -73,7 +132,7 @@ function dmapUrl(table: Table, predicates: Predicate[], first: number, size: num
     if (
       !columns.has(predicate.column) ||
       !operatorSet.has(predicate.operator) ||
-      hasUnsafeSegment(predicate.value)
+      !safeValue(predicate.value, predicate.operator)
     )
       throw validationError('Unsupported DMAP selector.', { reason: 'invalid_selector' });
     if (index) paths.push('and');
@@ -108,6 +167,10 @@ function matches(row: PublicRow, predicate: Predicate): boolean {
     case 'greaterThanEqual':
       return typeof actual === 'number' ? actual >= Number(expected) : value >= expected;
   }
+}
+/** Match complete literal selectors independently of any reduced upstream predicate. */
+export function matchesPredicates(row: PublicRow, predicates: Predicate[]): boolean {
+  return predicates.every((predicate) => matches(row, predicate));
 }
 /** Read one sorted, one-based inclusive page; retry only transport/transient status failures. */
 export async function readPage(
@@ -183,7 +246,7 @@ export async function readPage(
         });
       }
       const rows = parseRows(table, raw);
-      if (rows.some((row) => predicates.some((predicate) => !matches(row, predicate))))
+      if (rows.some((row) => !matchesPredicates(row, predicates)))
         throw serviceUnavailable('EPA did not apply the requested table predicates.', {
           reason: 'upstream_contract_changed',
         });

@@ -2,7 +2,7 @@
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import MarkdownIt from 'markdown-it';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { formatSource, wireBytes } from '@/domain/source-output.js';
+import { formatSource } from '@/domain/source-output.js';
 import { getEnforcementActionsTool } from '@/mcp-server/tools/definitions/get-enforcement-actions.tool.js';
 import { fixture, output } from '../services/dataframe/canvas-fixtures.js';
 import { expectParity, network, paced, renderedText } from '../services/sdwis/sdwis-fixtures.js';
@@ -66,7 +66,7 @@ describe('literal source Markdown', () => {
     expect(renderedText(text)).toContain('"text" = "{\\"a\\":\\"\\\\n💧\\"}"');
   });
 
-  it('reconstructs oversized markup from rendered JSON chunks within the complete wire budget', async () => {
+  it('returns large markup whole and continues at the next undelivered row', async () => {
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
     const row = {
       pwsid: 'WA1234567',
@@ -77,47 +77,20 @@ describe('literal source Markdown', () => {
     const http = network([
       { path: /^\/dmapservice\/sdwis\.enforcement_action\//, rows: [row, next] },
     ]);
-    const first = await paced(runToolContract(getEnforcementActionsTool, { pwsid: 'WA1234567' }));
-    expect(first.isError).toBe(true);
-    const failure = first.structuredContent as {
-      error: { data: { reason: string; record_cursor: string } };
-    };
-    expect(failure.error.data.reason).toBe('item_too_large');
-    let cursor = failure.error.data.record_cursor;
-    let serialized = '';
-    let completed = false;
-    for (let i = 0; i < 30; i++) {
-      const response = await paced(
-        runToolContract(getEnforcementActionsTool, {
-          pwsid: 'WA1234567',
-          view: 'text',
-          record_cursor: cursor,
-        }),
-      );
-      expect(response.isError).not.toBe(true);
-      expectParity(response);
-      expect(new TextEncoder().encode(JSON.stringify(response)).byteLength).toBeLessThan(24000);
-      const value = response.structuredContent as Record<string, unknown>;
-      expect(value.offset).toBe(Array.from(serialized).length);
-      const visible = renderedText(
-        response.content
-          .filter((b) => b.type === 'text')
-          .map((b) => b.text)
-          .join('\n'),
-      );
-      const line = visible.split('\n').find((entry) => entry.startsWith('"text" = '));
-      expect(line).toBeDefined();
-      serialized += JSON.parse(line?.slice('"text" = '.length) ?? 'null');
-      cursor = String(value.next_cursor);
-      if (JSON.stringify(value.notices).includes('Record text complete.')) {
-        completed = true;
-        break;
-      }
-    }
-    expect(completed).toBe(true);
-    expect(JSON.parse(serialized)).toEqual({ ...row, enforcement_action_type_label: null });
+    const first = await paced(
+      runToolContract(getEnforcementActionsTool, { pwsid: 'WA1234567', limit: 1 }),
+    );
+    expect(first.isError).not.toBe(true);
+    expectParity(first);
+    expect(first.structuredContent).toMatchObject({
+      items: [{ ...row, enforcement_action_type_label: null }],
+      returned: 1,
+      has_more: true,
+    });
+    const cursor = (first.structuredContent as { next_cursor: string }).next_cursor;
+    expect(typeof cursor).toBe('string');
     const last = await paced(
-      runToolContract(getEnforcementActionsTool, { pwsid: 'WA1234567', cursor }),
+      runToolContract(getEnforcementActionsTool, { pwsid: 'WA1234567', cursor, limit: 1 }),
     );
     expectParity(last);
     expect(last.structuredContent).toMatchObject({ items: [next], has_more: false });
@@ -141,12 +114,11 @@ describe('literal source Markdown', () => {
       );
       const alias = '![alias](https://example.invalid/image) **bold** <i>x</i> &copy; `x`';
       const result = await f.service.query(
-        { canvas_id: h.canvas_id, sql: `SELECT 7 AS "${alias}"`, view: 'records', limit: 10 },
+        { canvas_id: h.canvas_id, sql: `SELECT 7 AS "${alias}"`, limit: 10 },
         f.ctx,
       );
       expect(result.items).toEqual([{ [alias]: 7 }]);
       expectParity({ structuredContent: result, content: formatSource(result) });
-      expect(wireBytes(result)).toBeLessThan(24000);
     } finally {
       await f.canvas.shutdown(f.ctx);
     }

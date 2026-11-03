@@ -24,7 +24,7 @@ export const searchContaminantsTool = tool('sdwis_search_contaminants', {
     dataset: z
       .enum(['violations', 'lcr', 'ucmr5'])
       .describe(
-        'Evidence source: violations for SDWA violations, lcr for lead/copper summaries, ucmr5 for occurrence measurements; provide pwsid or state for every dataset.',
+        'Evidence source: violations for SDWA violations, lcr for lead/copper summaries, ucmr5 for occurrence measurements; provide pwsid or state, or zip alone for ucmr5.',
       ),
     ...geographyFields,
     ...dateFields,
@@ -149,17 +149,10 @@ export const searchContaminantsTool = tool('sdwis_search_contaminants', {
       recovery:
         'Use the source tool without stage, or run the npm or Docker server with CANVAS_PROVIDER_TYPE=duckdb.',
     },
-    {
-      reason: 'item_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'A complete record cannot fit inline.',
-      recovery:
-        'Repeat this tool with view text and the returned record_cursor to read the complete record in text chunks.',
-    },
   ],
   handler(input, ctx) {
-    if (!input.pwsid && !input.state) throw ctx.fail('invalid_selector', 'Provide pwsid or state.');
+    if (!input.pwsid && !input.state && !(input.dataset === 'ucmr5' && input.zip))
+      throw ctx.fail('invalid_selector', 'Provide pwsid or state, or zip for dataset ucmr5.');
     if (input.canvas_id && !input.stage)
       throw ctx.fail('invalid_selector', 'canvas_id requires stage true.');
     if (input.dataset !== 'ucmr5' && (input.zip !== undefined || input.detected_only !== undefined))

@@ -1,5 +1,5 @@
 /**
- * @fileoverview Source output envelope and reversible formatting used for wire-byte accounting.
+ * @fileoverview Source output envelope and reversible whole-row formatting.
  * @module domain/source-output
  */
 import { z } from '@cyanheads/mcp-ts-core';
@@ -78,7 +78,7 @@ export const selectionCoverageSchema = z
   .describe('Canvas-wide source acquisition coverage, snapshotted for retained SQL results.');
 /** Compact source-chain coverage entry. */
 export type SelectionCoverage = z.infer<typeof selectionCoverageSchema>;
-/** Common source fields, including optional lossless oversized-record text chunks. */
+/** Common source fields preserve whole rows and exact continuation positions. */
 export const sourceOutputShape = {
   effective_filters: z
     .record(z.string(), z.unknown())
@@ -113,13 +113,6 @@ export const sourceOutputShape = {
     .describe(
       'True when this inline preview omits retained or unfetched source rows; follow the exact continuation or live dataset.',
     ),
-  record_identity: z.string().optional().describe('Identity of the oversized record being read.'),
-  encoding: z
-    .literal('json')
-    .optional()
-    .describe('Concatenated text is the exact serialized JSON record.'),
-  text: z.string().optional().describe('Lossless code-point-aligned record text chunk.'),
-  offset: z.number().int().optional().describe('Unicode code-point offset of this chunk.'),
 };
 /** Normalized source output used by producers and staging integration. */
 export type SourceOutput = z.infer<z.ZodObject<typeof sourceOutputShape>>;
@@ -149,51 +142,4 @@ export function formatSource(result: Record<string, unknown>): { type: 'text'; t
   };
   visit(result, '');
   return [{ type: 'text', text: lines.join('\n') }];
-}
-/** Actual serialized MCP dual-surface bytes, including envelope and notices. */
-export function wireBytes(result: Record<string, unknown>): number {
-  return new TextEncoder().encode(
-    JSON.stringify({ content: formatSource(result), structuredContent: result }),
-  ).byteLength;
-}
-/** Inline packing stays below this many wire bytes, leaving room for trailing notices. */
-export const INLINE_BUDGET_BYTES = 23000;
-/** Hard ceiling for a complete serialized tool result. */
-export const RESPONSE_LIMIT_BYTES = 24000;
-/**
- * Append whole candidates to `page` while `measure()` stays below `budgetBytes`; the crossing
- * candidate is removed again, so no item is ever cut. `measure` sees the page with the candidate.
- */
-export function packItems<T>(
-  page: T[],
-  candidates: readonly T[],
-  budgetBytes: number,
-  measure: () => number,
-): void {
-  for (const candidate of candidates) {
-    page.push(candidate);
-    if (measure() >= budgetBytes) {
-      page.pop();
-      return;
-    }
-  }
-}
-/**
- * Largest code-point end at or after `start` whose chunk keeps the wire below the inline budget.
- * `measure(end)` renders the response with the chunk `[start, end)` and returns its wire bytes.
- */
-export function fitTextChunk(
-  points: readonly string[],
-  start: number,
-  measure: (end: number) => number,
-): number {
-  let end = start;
-  let upper = points.length;
-  // Binary search over code-point boundaries rather than rendering every growing prefix.
-  while (end < upper) {
-    const candidate = Math.ceil((end + upper) / 2);
-    if (measure(candidate) < INLINE_BUDGET_BYTES) end = candidate;
-    else upper = candidate - 1;
-  }
-  return end;
 }

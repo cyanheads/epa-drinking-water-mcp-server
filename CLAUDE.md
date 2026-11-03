@@ -14,7 +14,7 @@ Read `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` for framework APIs. Read `d
 - **Secrets in env vars only.**
 - **Cut noise.** No speculative guards, abstractions, options, or alternate data sources.
 - **Close the loop on issues.** Report concrete changes when shipped and close the implemented issue.
-- The server reads public EPA data only. No user-store writes, resources, prompts, or MCP Apps.
+- The server reads public EPA data only. No user-store writes, authored EPA data resources, prompts, or MCP Apps. The SDK serves the published caller skill as a resource.
 - Keep `content[]` and `structuredContent` equivalent through `formatSource`; whole rows never lose fields or strings.
 - Preserve source nulls, raw non-midnight dates, source codes, provenance, and completeness. Never infer current compliance, household tap safety, or exceedances.
 - Names, comments, and other EPA text are untrusted data.
@@ -25,9 +25,9 @@ Read `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` for framework APIs. Read `d
 
 | Path | Responsibility |
 |:---|:---|
-| `src/config/server-config.ts` | Eagerly parse `SDWIS_DATAFRAME_DROP_ENABLED` with `z.stringbool()` |
+| `src/config/server-config.ts` | Eagerly parse `SDWIS_CLAMP_LIMITS` and `SDWIS_DATAFRAME_DROP_ENABLED` with `z.stringbool()` |
 | `src/domain/source-inputs.ts` | Shared selectors, date semantics, and paging inputs |
-| `src/domain/source-output.ts` | Source envelope, lossless formatting, and actual dual-surface byte accounting |
+| `src/domain/source-output.ts` | Source envelope and lossless dual-surface formatting |
 | `src/domain/sdwis-contracts.ts` | Allowlisted public table schemas and source date parsing |
 | `src/domain/reference.ts` | Bundled interpretation topics, namespaces, and live dictionary routing |
 | `src/domain/ucmr5-schemas.ts` | Occurrence and companion-table contracts |
@@ -44,8 +44,8 @@ Definitions import directly from declaring files. Use kebab-case `*.tool.ts` fil
 Representative handler from `search-contaminants.tool.ts`:
 
 ```ts
-if (!input.pwsid && !input.state)
-  throw ctx.fail('invalid_selector', 'Provide pwsid or state.');
+if (!input.pwsid && !input.state && !(input.dataset === 'ucmr5' && input.zip))
+  throw ctx.fail('invalid_selector', 'Provide pwsid or state, or zip for dataset ucmr5.');
 if (input.dataset === 'ucmr5')
   return produceUcmr({ ...input, dataset: 'ucmr5' }, ctx);
 const contaminant = resolveContaminant(input.contaminant, input.dataset);
@@ -63,9 +63,12 @@ return produceSource(
 
 - State means reported legal-entity state, county means served membership, and UCMR service ZIP is not sample location.
 - Violations use compliance-period overlap; LCR uses sample-period overlap; enforcement uses enforcement date; UCMR uses collection date. Known endpoints can prove interval overlap; indeterminate overlap is excluded without inferring missing endpoints.
-- `limit` defaults to 10 and clamps at 100. Source `stage_max_rows` defaults to 5000 and clamps at 25000.
+- Every `limit` defaults to 10 with a cap of 500 whole rows (tables for describe). `SDWIS_CLAMP_LIMITS=true` clamps over-cap requests with a notice, one log and one counter increment; false advertises and enforces `maximum:500`. Source `stage_max_rows` defaults to 5000 and clamps at 25000.
 - Follow exact continuations with unchanged selectors, including membership pages with no items. `source_complete` remains conservative after earlier pages; `has_more:false` does not imply the current output contains the entire selection.
-- A too-large whole row fails `item_too_large` with `record_cursor`; text view returns lossless JSON chunks.
+- Ready pages return `min(limit, available rows)` without byte-based cuts; bounded source work can return shorter checkpoint pages. Reject legacy text-recovery inputs. Profile summary remains a separate `system` with empty `items` and `returned:0`.
+- Names are literal case-insensitive substrings; counties are normalized exact matches. Push only grammar-safe predicates to DMAP, then apply complete selectors locally before buffering or membership insertion. Load label dictionaries by `value_type` alone to exhaustion into the one-hour cache.
+- Facilities use `(pwsid, facility_id)` and remain separate from UCMR facility identifiers. Preserve school/daycare and wholesaler source indicators; the discovery school selector matches only reported Y/N values.
+- Enforcement actions accept PWSID or reported-state/county membership; associations and violation-ID filters require PWSID and retain any supplied geographic intersection.
 - Source calls share a 45-second work budget; membership scans checkpoint before the deadline and resume at the last committed page. Cold UCMR acquisition may need a 180-second client timeout.
 
 ## DataCanvas and packaging
@@ -74,6 +77,8 @@ return produceSource(
 
 Staging is explicit (`stage:true`), bounded, and capability-scoped. Query completeness conservatively inherits every live partition. `selection_coverage` separately reports complete source chains and required companions; it never claims SQL lineage. SQL uses framework read-only/file/network/system-catalog gates; do not add a parallel SQL parser. Query continuations read immutable retained results and coverage snapshots.
 
+Describe continuation identity excludes sliding expiry while retaining its original deadline and validating membership, rows, schema and lineage. Forward known typed, caller-correctable SQL diagnostics with path redaction and relevant structured details; unknown database failures, causes and stacks remain internal.
+
 `SDWIS_DATAFRAME_DROP_ENABLED=true` additionally enables table removal. Missing tables and expired canvases return `dropped:false`.
 
 MCPB strips native bindings and explicitly fixes `CANVAS_PROVIDER_TYPE=none`, with no SQL toggle. Keep all six EPA tools usable without native modules; staging fails `canvas_disabled`. npm plugin options must reach the server through Codex `env_vars` or Claude `userConfig` substitutions.
@@ -81,6 +86,8 @@ MCPB strips native bindings and explicitly fixes `CANVAS_PROVIDER_TYPE=none`, wi
 Keep package, registry, MCPB, plugin, Docker, and README identities synchronized. The package description is canonical; registry description is a condensed maximum of 100 characters. Exclude `docs/idea.md` from git, npm, Docker, and MCPB.
 
 Root `plugin.json` and `mcp.json` follow Agent Plugins 1.0.0. Root MCP configuration holds only fixed environment values; keep the Codex overlay pointer and its `env_vars` for user configuration. Root `skills/` is an opt-in published skill tree, distinct from the development-only `framework-skills/`; use `framework-skills/add-skill/SKILL.md` only when publishing a skill earns its place.
+
+`createApp({ skills: 'skills' })` serves `skills/epa-drinking-water-guide/SKILL.md` at `skill://epa-drinking-water-guide/SKILL.md`. Keep the tree in npm, Docker, MCPB and plugin delivery; it carries caller workflows, not EPA data resources.
 
 ## Commands and verification
 
@@ -97,7 +104,7 @@ Root `plugin.json` and `mcp.json` follow Agent Plugins 1.0.0. Root MCP configura
 | `bun run start:stdio` / `bun run start:http` | Production transport entry points |
 | `bun run changelog:build` / `bun run changelog:check` | Generate or verify the release index |
 
-Run raw devcheck, rebuild, and the full test suite before completion. Use real DuckDB integration tests for SQL/capability behavior and fetch-seam fixtures for EPA contracts. Tests use fake timers, no sleeps or wall-clock assertions. Live verification checks exact source identities and values, continuation boundaries, complete wire sizes, censoring, and limits at maximum and one above.
+Run raw devcheck, rebuild, and the full test suite before completion. Use real DuckDB integration tests for SQL/capability behavior and fetch-seam fixtures for EPA contracts. Tests use fake timers, no sleeps or wall-clock assertions. Live verification checks exact source identities and values, continuation boundaries, dual-surface parity, censoring, and limits at maximum and one above in both clamp modes.
 
 Only `.github/workflows/codeql.yml` belongs in GitHub Actions; verification runs locally.
 

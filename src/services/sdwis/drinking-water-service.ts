@@ -12,17 +12,17 @@ import {
   serviceUnavailable,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
-import type { PublicRow, Table } from '@/domain/sdwis-contracts.js';
+import { resolveInlineLimit } from '@/domain/inline-limit.js';
+import { type PublicRow, sortColumns, type Table } from '@/domain/sdwis-contracts.js';
 import { normalizeSelectors, selectionFilters } from '@/domain/source-inputs.js';
+import type { SourceOutput } from '@/domain/source-output.js';
 import {
-  fitTextChunk,
-  INLINE_BUDGET_BYTES,
-  packItems,
-  RESPONSE_LIMIT_BYTES,
-  type SourceOutput,
-  wireBytes,
-} from '@/domain/source-output.js';
-import { type Predicate, readPage, type SourcePage } from './sdwis-client.js';
+  matchesPredicates,
+  type Predicate,
+  pushdownPredicates,
+  readPage,
+  type SourcePage,
+} from './sdwis-client.js';
 
 /** A source partition submitted to the real canvas service; no synthetic handles are minted here. */
 export interface SourcePartition {
@@ -53,12 +53,10 @@ export interface UcmrInput {
   detected_only?: boolean | undefined;
   limit?: number | undefined;
   pwsid?: string | undefined;
-  record_cursor?: string | undefined;
   stage?: boolean | undefined;
   stage_max_rows?: number | undefined;
   state?: string | undefined;
   state_basis?: string | undefined;
-  view?: 'records' | 'text' | undefined;
   zip?: string | undefined;
 }
 export type UcmrProducer = (input: UcmrInput, ctx: Context) => Promise<SourceOutput>;
@@ -128,7 +126,6 @@ interface Job {
   sourcePages: Map<string, { etag?: string; last_modified?: string; fingerprint: string }>;
   step: number;
   table: Table;
-  text?: { row: PublicRow };
   tool: string;
   touched: number;
 }
@@ -136,16 +133,12 @@ const jobs = new Map<string, Job>();
 const tokenSchema = z.object({
   job: z.string(),
   step: z.number().int(),
-  kind: z.enum(['page', 'text']),
-  offset: z.number().int().optional(),
 });
-function sign(job: Job, kind: 'page' | 'text' = 'page', offset?: number): string {
+function sign(job: Job): string {
   const data = Buffer.from(
     JSON.stringify({
       job: job.id,
       step: job.step,
-      kind,
-      ...(offset === undefined ? {} : { offset }),
     }),
   ).toString('base64url');
   return `${data}.${createHmac('sha256', key).update(data).digest('base64url')}`;
@@ -276,6 +269,10 @@ function inventoryPredicates(filters: Record<string, unknown>): Predicate[] {
     ...predicate('pws_type_code', filters.system_type),
     ...predicate('primacy_agency_code', filters.primacy_agency),
     ...predicate('pwsid', filters.pwsid_prefix, 'beginsWith'),
+    ...predicate(
+      'is_school_or_daycare_ind',
+      filters.school_or_daycare === undefined ? undefined : filters.school_or_daycare ? 'Y' : 'N',
+    ),
     ...(filters.activity === 'active'
       ? predicate('pws_activity_code', 'A')
       : filters.activity === 'inactive'
@@ -319,20 +316,9 @@ function factPredicates(job: Job): Predicate[] {
     );
   if (job.table === 'violation_enf_assoc')
     selected.push(...predicate('violation_id', f.violation_id));
+  if (job.table === 'water_system_facility')
+    selected.push(...predicate('facility_id', f.facility_id));
   return selected;
-}
-function identity(row: PublicRow): string {
-  return JSON.stringify([
-    row.pwsid,
-    row.violation_id,
-    row.enforcement_id,
-    row.sample_id,
-    row.sar_id,
-    row.value_type,
-    row.value_code,
-    row.facility_id,
-    row.treatment_id,
-  ]);
 }
 function overlap(
   row: PublicRow,
@@ -361,6 +347,7 @@ function overlap(
 /** Tables whose sort key is unique, so a repeated page or boundary row means paging stalled. */
 const uniqueKeyTables = new Set<Table>([
   'water_system',
+  'water_system_facility',
   'violation',
   'enforcement_action',
   'lcr_sample',
@@ -391,7 +378,8 @@ function retain(job: Job, table: Table, page: SourcePage): void {
   });
   job.provenance = page;
 }
-const codeLabels = new Map<string, { label: string | null; expires: number }>();
+/** One bounded entry per value type in labelColumns; install only fully acquired dictionaries. */
+const codeLabels = new Map<string, { labels: Map<string, string | null>; expires: number }>();
 /** Code columns decoded per table, each with its `ref_code_value` value type. */
 const labelColumns: Partial<Record<Table, [column: string, valueType: string][]>> = {
   violation: [
@@ -400,6 +388,7 @@ const labelColumns: Partial<Record<Table, [column: string, valueType: string][]>
     ['violation_category_code', 'VIOLATION_CATEGORY_CODE'],
   ],
   enforcement_action: [['enforcement_action_type_code', 'ENFORCEMENT_ACTION_TYPE_CODE']],
+  water_system_facility: [['facility_type_code', 'FACILITY_TYPE_CODE']],
   treatment: [
     ['treatment_objective_code', 'TREATMENT_OBJECTIVE_CODE'],
     ['treatment_process_code', 'TREATMENT_PROCESS_CODE'],
@@ -410,45 +399,55 @@ const labelColumns: Partial<Record<Table, [column: string, valueType: string][]>
 async function enrichLabels(table: Table, rows: PublicRow[], signal: AbortSignal): Promise<number> {
   let pages = 0;
   for (const [column, valueType] of labelColumns[table] ?? []) {
-    const codes = [
-      ...new Set(rows.flatMap((row) => (typeof row[column] === 'string' ? [row[column]] : []))),
-    ];
-    const missing = codes.filter((code) => {
-      const cached = codeLabels.get(`${valueType}:${code}`);
-      return !cached || cached.expires < Date.now();
-    });
-    if (missing.length) {
+    let cached = codeLabels.get(valueType);
+    if (
+      rows.some((row) => typeof row[column] === 'string') &&
+      (!cached || cached.expires < Date.now())
+    ) {
       const predicates: Predicate[] = [
         { column: 'value_type', operator: 'equals', value: valueType },
-        { column: 'value_code', operator: 'in', value: missing.join(',') },
       ];
-      const page = await readPage('ref_code_value', predicates, 1, PAGE_SIZE, signal);
-      pages++;
-      const labels = new Map(
-        page.rows.map((row) => [
-          `${row.value_type}:${row.value_code}`,
-          typeof row.value_description === 'string' ? row.value_description : null,
-        ]),
-      );
-      for (const code of missing)
-        codeLabels.set(`${valueType}:${code}`, {
-          label: labels.get(`${valueType}:${code}`) ?? null,
-          expires: Date.now() + 3600000,
-        });
-      while (codeLabels.size > 10000) {
-        const oldest = codeLabels.keys().next().value;
-        if (oldest) codeLabels.delete(oldest);
+      const labels = new Map<string, string | null>();
+      let offset = 1;
+      let publication: SourcePage | undefined;
+      while (true) {
+        const page = await readPage('ref_code_value', predicates, offset, PAGE_SIZE, signal);
+        pages++;
+        if (
+          publication &&
+          ((publication.etag && page.etag && publication.etag !== page.etag) ||
+            (publication.last_modified &&
+              page.last_modified &&
+              publication.last_modified !== page.last_modified))
+        )
+          throw conflict('EPA label dictionary changed during retrieval.', {
+            reason: 'source_changed',
+          });
+        publication = page;
+        for (const row of page.rows) {
+          const code = String(row.value_code);
+          if (labels.has(code))
+            throw serviceUnavailable('EPA repeated a label dictionary key without progress.', {
+              reason: 'upstream_paging_changed',
+            });
+          labels.set(
+            code,
+            typeof row.value_description === 'string' ? row.value_description : null,
+          );
+        }
+        offset += page.rows.length;
+        if (page.rows.length < PAGE_SIZE) break;
       }
+      cached = { labels, expires: Date.now() + 3600000 };
+      codeLabels.set(valueType, cached);
     }
     for (const row of rows)
       row[column.replace(/_code$/, '_label')] =
-        typeof row[column] === 'string'
-          ? (codeLabels.get(`${valueType}:${row[column]}`)?.label ?? null)
-          : null;
+        typeof row[column] === 'string' ? (cached?.labels.get(String(row[column])) ?? null) : null;
   }
   return pages;
 }
-/** Acquire up to the requested source rows under twenty DMAP pages, preserving pending rows exactly. */
+/** Acquire source rows with scan checkpoints and a shared deadline, preserving pending rows exactly. */
 async function advance(
   job: Job,
   target: number,
@@ -474,7 +473,13 @@ async function advance(
       : undefined;
     try {
       const pageSignal = membership ? AbortSignal.any([signal, checkpoint.signal]) : signal;
-      const page = await readPage(table, predicates, offset, PAGE_SIZE, pageSignal);
+      const page = await readPage(
+        table,
+        pushdownPredicates(predicates),
+        offset,
+        PAGE_SIZE,
+        pageSignal,
+      );
       // An upstream ignoring abort must not commit a page after the checkpoint.
       pageSignal.throwIfAborted();
       pages++;
@@ -499,10 +504,12 @@ async function advance(
     // Do not begin fact I/O with less than one normal request window after a slow membership walk.
     if (readMembership && job.phase === 'facts' && workDeadline - Date.now() < 15000) break;
     if (job.phase === 'inventory') {
-      const page = await read('water_system', inventoryPredicates(job.filters), job.offset);
+      const predicates = inventoryPredicates(job.filters);
+      const page = await read('water_system', predicates, job.offset);
       if (!page) break;
       readMembership = true;
-      for (const row of page.rows) job.ids.push(String(row.pwsid));
+      for (const row of page.rows)
+        if (matchesPredicates(row, predicates)) job.ids.push(String(row.pwsid));
       job.ids = [...new Set(job.ids)];
       if (job.ids.length > 100000)
         throw rateLimited('Membership exceeds 100000 systems; narrow the geographic selection.', {
@@ -516,14 +523,12 @@ async function advance(
       continue;
     }
     if (job.phase === 'geography') {
-      const page = await read(
-        'geographic_area',
-        predicate('county_served', job.filters.county),
-        job.offset,
-      );
+      const predicates = predicate('county_served', job.filters.county);
+      const page = await read('geographic_area', predicates, job.offset);
       if (!page) break;
       readMembership = true;
-      for (const row of page.rows) job.geographicIds.add(String(row.pwsid));
+      for (const row of page.rows)
+        if (matchesPredicates(row, predicates)) job.geographicIds.add(String(row.pwsid));
       if (job.geographicIds.size > 100000)
         throw rateLimited('County membership exceeds the selection budget; narrow the selection.', {
           reason: 'selection_capacity_exhausted',
@@ -555,22 +560,28 @@ async function advance(
       continue;
     }
     if (!job.associationsComplete) {
-      const page = await read(
-        'violation_enf_assoc',
-        [
-          ...predicate('pwsid', job.filters.pwsid),
-          ...predicate('violation_id', job.filters.violation_id),
-        ],
-        job.associationOffset,
-      );
+      const predicates = [
+        ...predicate('pwsid', job.filters.pwsid),
+        ...predicate('violation_id', job.filters.violation_id),
+      ];
+      const page = await read('violation_enf_assoc', predicates, job.associationOffset);
       if (!page) break;
-      for (const row of page.rows) job.associations.add(`${row.pwsid}:${row.enforcement_id}`);
+      for (const row of page.rows)
+        if (matchesPredicates(row, predicates))
+          job.associations.add(`${row.pwsid}:${row.enforcement_id}`);
       job.associationOffset += page.rows.length;
       if (page.rows.length < PAGE_SIZE) job.associationsComplete = true;
       capacity();
       continue;
     }
-    const page = await readPage(job.table, factPredicates(job), job.offset, PAGE_SIZE, signal);
+    const predicates = factPredicates(job);
+    const page = await readPage(
+      job.table,
+      pushdownPredicates(predicates),
+      job.offset,
+      PAGE_SIZE,
+      signal,
+    );
     pages++;
     // retain() fingerprints the rows after labels are attached; keep this order.
     pages += await enrichLabels(job.table, page.rows, signal);
@@ -578,13 +589,18 @@ async function advance(
     if (
       uniqueKeyTables.has(job.table) &&
       page.rows.length &&
-      job.previousBoundary === JSON.stringify(page.rows[0])
+      job.previousBoundary ===
+        JSON.stringify(sortColumns(job.table).map((column) => page.rows[0]?.[column]))
     )
       throw serviceUnavailable('EPA repeated a page boundary without progress.', {
         reason: 'upstream_paging_changed',
       });
-    if (page.rows.length) job.previousBoundary = JSON.stringify(page.rows.at(-1));
+    if (page.rows.length)
+      job.previousBoundary = JSON.stringify(
+        sortColumns(job.table).map((column) => page.rows.at(-1)?.[column]),
+      );
     for (let row of page.rows) {
+      if (!matchesPredicates(row, predicates)) continue;
       if (
         job.table === 'water_system' &&
         job.filters.county &&
@@ -718,6 +734,7 @@ export async function produceSource(
   bundledRows?: PublicRow[],
 ): Promise<SourceOutput> {
   const normalized = normalizeSelectors(input);
+  const { limit, notices: limitNotices } = resolveInlineLimit(Number(input.limit ?? 10), ctx);
   if (normalized.canvas_id && !normalized.stage)
     throw validationError('canvas_id requires stage true.', { reason: 'invalid_selector' });
   if (normalized.stage && !stageProducer)
@@ -725,18 +742,13 @@ export async function produceSource(
       'DataCanvas staging is disabled; use inline records or an enabled npm/Docker runtime.',
       { reason: 'canvas_disabled' },
     );
-  const cursor =
-    typeof input.record_cursor === 'string'
-      ? input.record_cursor
-      : typeof input.cursor === 'string'
-        ? input.cursor
-        : undefined;
+  const cursor = typeof input.cursor === 'string' ? input.cursor : undefined;
   const requestFingerprint = JSON.stringify(
     Object.entries(normalized)
       .filter(([name]) => name !== 'cursor')
       .sort(),
   );
-  if (cursor && input.view !== 'text') {
+  if (cursor) {
     const parsed = token(cursor);
     const previous = jobs.get(parsed.job);
     if (
@@ -764,11 +776,8 @@ export async function produceSource(
       job.pending = bundledRows.filter((row) => matchesQuery(row, input.query));
       job.phase = 'done';
     }
-    const limit = Math.min(100, Number(input.limit ?? 10));
     const stageMax = Math.min(25000, Number(input.stage_max_rows ?? 5000));
-    const notices = [caveat];
-    if (Number(input.limit ?? 10) > 100)
-      notices.push('Requested limit was clamped to the effective maximum 100.');
+    const notices = [caveat, ...limitNotices];
     if (Number(input.stage_max_rows ?? 5000) > 25000)
       notices.push('Requested stage_max_rows was clamped to 25000.');
     if (input.activity === 'active')
@@ -776,54 +785,6 @@ export async function produceSource(
         'Discovery includes active systems by default; use activity all to include inactive records.',
       );
     const result = envelope(job, limit, notices);
-    if (input.view === 'text') {
-      if (!cursor || !job.text)
-        throw validationError(
-          'Text view requires the record_cursor returned for this oversized record.',
-          { reason: 'cursor_invalid' },
-        );
-      const points = Array.from(JSON.stringify(job.text.row));
-      const offset = token(cursor).offset ?? 0;
-      result.selection_partition = {
-        selection_id: job.id,
-        partition: job.partition,
-        final_partition: null,
-      };
-      result.record_identity = identity(job.text.row);
-      result.encoding = 'json';
-      result.offset = offset;
-      // Each probe carries the exact signed offset token it would return.
-      const end = fitTextChunk(points, offset, (candidate) => {
-        result.text = points.slice(offset, candidate).join('');
-        result.has_more = candidate < points.length;
-        result.next_cursor = sign(job, 'text', candidate);
-        return wireBytes(result);
-      });
-      result.text = points.slice(offset, end).join('');
-      result.has_more = end < points.length;
-      if (result.has_more) result.next_cursor = sign(job, 'text', end);
-      else {
-        if (job.pending[0] === job.text.row) job.pending.shift();
-        job.deliveredRows++;
-        job.partition++;
-        job.step++;
-        result.has_more = job.phase !== 'done' || job.pending.length > 0;
-        if (!result.has_more)
-          result.selection_partition.final_partition = result.selection_partition.partition;
-        result.phase = 'source';
-        if (result.has_more) result.next_cursor = sign(job);
-        else delete result.next_cursor;
-        notices.push(
-          'Record text complete. Any next_cursor now continues this source tool with view records and the original selectors, omitting record_cursor.',
-        );
-      }
-      result.source_complete = false;
-      return result;
-    }
-    if (input.record_cursor)
-      throw validationError('record_cursor is only valid with view text.', {
-        reason: 'invalid_selector',
-      });
     const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(WORK_BUDGET_MS)]);
     const overlapCounts = await advance(job, normalized.stage ? stageMax : limit + 1, signal);
     if (overlapCounts.unknown)
@@ -840,7 +801,10 @@ export async function produceSource(
       job.pending.push(...rows.filter((row) => matchesQuery(row, input.query)));
       job.referenceExtrasAdded = true;
     }
-    const staged = normalized.stage ? job.pending.slice(0, stageMax) : undefined;
+    const staged =
+      normalized.stage && outputPhase(job) !== 'membership'
+        ? job.pending.slice(0, stageMax)
+        : undefined;
     const candidates = (staged ?? job.pending).slice(0, limit);
     if (candidates.length || outputPhase(job) !== 'membership')
       result.selection_partition = {
@@ -849,23 +813,8 @@ export async function produceSource(
         final_partition: null,
       };
     job.step++;
-    packItems(result.items, candidates, normalized.stage ? 20000 : INLINE_BUDGET_BYTES, () => {
-      result.returned = result.items.length;
-      result.has_more = true;
-      result.next_cursor = sign(job);
-      return wireBytes(result);
-    });
+    result.items = candidates;
     result.returned = result.items.length;
-    const [first] = candidates;
-    if (!result.items.length && first) {
-      job.text = { row: first };
-      throw validationError('A complete source record exceeds the inline wire budget.', {
-        reason: 'item_too_large',
-        record_cursor: sign(job, 'text', 0),
-        source_cursor: sign(job),
-        follow_up: { tool, view: 'text', record_cursor: sign(job, 'text', 0) },
-      });
-    }
     if (!staged) job.pending.splice(0, result.items.length);
     result.phase = outputPhase(job);
     result.has_more = job.phase !== 'done' || job.pending.length > (staged?.length ?? 0);
@@ -905,10 +854,6 @@ export async function produceSource(
     if (!result.has_more && !result.source_complete)
       notices.push(
         'Retrieval is exhausted; earlier rows were delivered in previous outputs or staged partitions, so this output is not the entire selected source.',
-      );
-    if (wireBytes(result) >= RESPONSE_LIMIT_BYTES)
-      throw serviceUnavailable(
-        'Source envelope exceeds the response budget; narrow the selection.',
       );
     job.replay = {
       step: job.step - 1,

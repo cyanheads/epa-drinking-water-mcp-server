@@ -4,39 +4,46 @@
  */
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { type Context, z } from '@cyanheads/mcp-ts-core';
-import type {
-  CanvasInstance,
-  ColumnSchema,
-  DataCanvas,
-  QueryResult,
-  TableInfo,
+import {
+  type CanvasInstance,
+  type ColumnSchema,
+  type DataCanvas,
+  DUCKDB_ERROR_REASONS,
+  type QueryResult,
+  SQL_GATE_REASONS,
+  type TableInfo,
 } from '@cyanheads/mcp-ts-core/canvas';
 import {
   configurationError,
   databaseError,
+  JsonRpcErrorCode,
   McpError,
   notFound,
   rateLimited,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
+import { resolveInlineLimit } from '@/domain/inline-limit.js';
 import { type PublicRow, type Table, tableSchemas } from '@/domain/sdwis-contracts.js';
-import {
-  fitTextChunk,
-  INLINE_BUDGET_BYTES,
-  packItems,
-  RESPONSE_LIMIT_BYTES,
-  type SelectionCoverage,
-  type SourceOutput,
-  wireBytes,
-} from '@/domain/source-output.js';
+import type { SelectionCoverage, SourceOutput } from '@/domain/source-output.js';
 import type { SourcePartition } from '@/services/sdwis/drinking-water-service.js';
 
 /** Every capability carries executable next steps. */
 export const CANVAS_POINTER =
   'Use sdwis_dataframe_describe with this canvas_id to inspect table names and columns, then sdwis_dataframe_query with this canvas_id to analyze the staged rows.';
 const TTL_MS = 3600000;
-/** Upper bound for signed position tokens, including describe selection fingerprints. */
-const CURSOR_PLACEHOLDER = 'x'.repeat(384);
+/** Only framework caller-error contracts carry public diagnostics; arbitrary engine errors do not. */
+const SQL_DIAGNOSTICS = new Map<string, readonly string[]>([
+  [SQL_GATE_REASONS.invalidSql, ['binderMessage', 'statementType']],
+  [SQL_GATE_REASONS.deniedFunction, ['function']],
+  [SQL_GATE_REASONS.deniedFunctionInPlan, ['functions']],
+  [SQL_GATE_REASONS.planOperatorNotAllowed, ['operators']],
+  [SQL_GATE_REASONS.systemCatalogAccess, ['catalog']],
+  [SQL_GATE_REASONS.multiStatement, ['statementCount']],
+  [SQL_GATE_REASONS.nonSelectStatement, ['statementType']],
+  [DUCKDB_ERROR_REASONS.sqlExecutionError, []],
+  [DUCKDB_ERROR_REASONS.sqlParseError, []],
+  [DUCKDB_ERROR_REASONS.sqlReadOnly, []],
+]);
 const capacityExhausted = () =>
   rateLimited(
     'Reuse a canvas_id you already hold, wait for expiry, or narrow the source selection.',
@@ -47,7 +54,6 @@ const cursorSchema = z
     kind: z.enum(['describe', 'query']),
     entry: z.string(),
     offset: z.number().int().nonnegative(),
-    textOffset: z.number().int().nonnegative().optional(),
     expires: z.number().int(),
   })
   .strict();
@@ -99,38 +105,28 @@ interface CacheEntry {
 type Cursor = z.infer<typeof cursorSchema>;
 interface DescribeOutput extends Record<string, unknown> {
   canvas_id: string;
-  encoding?: 'json';
   has_more: boolean;
   items: Record<string, unknown>[];
   next_cursor?: string;
   notices: string[];
-  offset?: number;
-  phase?: 'records' | 'text';
   pointer: string;
-  record_identity?: string;
   returned: number;
   selection_coverage: SelectionCoverage;
-  text?: string;
   totalCount: number;
 }
 interface SqlOutput extends Record<string, unknown> {
   canvas_id: string;
   columns: string[];
-  encoding?: 'json';
   has_more: boolean;
   items: Record<string, unknown>[];
   next_cursor?: string;
   notices: string[];
-  offset?: number;
-  phase?: 'records' | 'text';
   pointer: string;
   provenance: unknown[];
-  record_identity?: string;
   returned: number;
   row_count: number;
   selection_coverage: SelectionCoverage;
   source_complete: boolean;
-  text?: string;
   truncated: boolean;
 }
 /** Validated query paging input; SQL is never interpreted by this service. */
@@ -138,9 +134,7 @@ export interface QueryInput {
   canvas_id: string;
   cursor?: string | undefined;
   limit: number;
-  record_cursor?: string | undefined;
   sql: string;
-  view: 'records' | 'text';
 }
 /** Explicitly typed source schema, including columns absent from sparse rows. */
 function sourceSchema(table: Table, rows: PublicRow[]): ColumnSchema[] {
@@ -393,6 +387,12 @@ export class CanvasService {
           { cause },
         );
       const reason = cause.data?.reason;
+      const diagnosticFields =
+        cause.code === JsonRpcErrorCode.ValidationError && typeof reason === 'string'
+          ? SQL_DIAGNOSTICS.get(reason)
+          : cause.code === JsonRpcErrorCode.NotFound && reason === 'missing_table'
+            ? ['tableName']
+            : undefined;
       const hint =
         reason === 'canvas_not_found'
           ? 'Check canvas_id or repeat the producing source tool with stage true.'
@@ -401,11 +401,17 @@ export class CanvasService {
             : 'Use sdwis_dataframe_describe with this canvas_id to check table names and columns, then retry sdwis_dataframe_query with one read-only statement against staged tables.';
       throw new McpError(
         cause.code,
-        'The canvas query was refused or could not complete; inspect its reason and recovery guidance.',
+        diagnosticFields
+          ? cause.message
+          : 'The canvas query was refused or could not complete; inspect its reason and recovery guidance.',
         {
           ...(typeof reason === 'string' ? { reason } : {}),
           recovery: { hint },
-          ...(typeof cause.data?.tableName === 'string' ? { tableName: cause.data.tableName } : {}),
+          ...Object.fromEntries(
+            (diagnosticFields ?? [])
+              .filter((field) => cause.data?.[field] !== undefined)
+              .map((field) => [field, cause.data?.[field]]),
+          ),
         },
         { cause },
       );
@@ -509,18 +515,17 @@ export class CanvasService {
       },
     );
   }
-  /** Inspect only the capability the caller supplied, with whole-item byte paging. */
+  /** Inspect only the capability the caller supplied, paging complete table metadata. */
   describe(
     input: {
       canvas_id: string;
       table_name?: string | undefined;
       cursor?: string | undefined;
       limit: number;
-      view?: 'records' | 'text' | undefined;
-      record_cursor?: string | undefined;
     },
     ctx: Context,
   ) {
+    const { limit, notices } = resolveInlineLimit(input.limit, ctx);
     return this.operation(input.canvas_id, ctx, async (instance, state) => {
       const tables = (await this.reconcile(instance, state, ctx.signal)).filter(
         (table) => !input.table_name || table.name === input.table_name,
@@ -532,32 +537,19 @@ export class CanvasService {
         columns: table.columns,
         ...state.tables.get(table.name),
       }));
-      const supplied = input.view === 'text' ? input.record_cursor : input.cursor;
-      if (
-        (input.view === 'text' && (!supplied || input.cursor)) ||
-        (input.view !== 'text' && input.record_cursor)
-      )
-        throw validationError('Text view requires record_cursor; records view uses cursor.', {
-          reason: 'cursor_invalid',
-        });
-      // Metadata must remain identical throughout records/text paging; no second cache is needed.
+      // Sliding TTL extensions do not change records-page membership or structural metadata.
       const entry = createHash('sha256')
         .update(
           JSON.stringify({
             canvas: input.canvas_id,
             tenant: state.tenant,
             table: input.table_name ?? null,
-            items,
+            items: items.map(({ expires_at: _expiresAt, ...identity }) => identity),
           }),
         )
         .digest('base64url');
-      const cursor = supplied ? this.readCursor(supplied, 'describe') : undefined;
-      if (
-        cursor &&
-        (cursor.entry !== entry ||
-          (input.view === 'text') !== (cursor.textOffset !== undefined) ||
-          cursor.offset > items.length)
-      )
+      const cursor = input.cursor ? this.readCursor(input.cursor, 'describe') : undefined;
+      if (cursor && (cursor.entry !== entry || cursor.offset > items.length))
         throw validationError('Describe continuation does not match this live selection.', {
           reason: 'cursor_invalid',
         });
@@ -569,103 +561,38 @@ export class CanvasService {
           Date.parse(instance.expiresAt),
           ...items.map((item) => Date.parse(item.expires_at)),
         );
-      const mint = (position: number, textOffset?: number) =>
+      const mint = (position: number) =>
         this.mintCursor({
           kind: 'describe',
           entry,
           offset: position,
           expires,
-          ...(textOffset === undefined ? {} : { textOffset }),
         });
+      const page = items.slice(offset, offset + limit);
+      const hasMore = offset + page.length < items.length;
       const output: DescribeOutput = {
         selection_coverage: this.coverage(state),
         canvas_id: instance.canvasId,
         pointer: CANVAS_POINTER,
-        items: [],
-        returned: 0,
+        items: page,
+        returned: page.length,
         totalCount: items.length,
-        has_more: false,
-        notices: input.limit > 100 ? ['Requested limit was clamped to 100.'] : [],
+        has_more: hasMore,
+        notices,
+        ...(hasMore ? { next_cursor: mint(offset + page.length) } : {}),
       };
-      if (input.view === 'text') {
-        const item = items[offset];
-        const start = cursor?.textOffset;
-        if (!item || start === undefined)
-          throw validationError('Invalid oversized-table continuation.', {
-            reason: 'cursor_invalid',
-          });
-        const points = Array.from(JSON.stringify(item));
-        if (start >= points.length)
-          throw validationError('Invalid oversized-table offset.', { reason: 'cursor_invalid' });
-        output.encoding = 'json';
-        output.offset = start;
-        output.record_identity = `${entry}:${offset}`;
-        output.next_cursor = CURSOR_PLACEHOLDER;
-        const end = fitTextChunk(points, start, (candidate) => {
-          output.text = points.slice(start, candidate).join('');
-          return wireBytes(output);
-        });
-        output.text = points.slice(start, end).join('');
-        output.has_more = end < points.length || offset + 1 < items.length;
-        if (end < points.length) {
-          output.next_cursor = mint(offset, end);
-          output.phase = 'text';
-        } else if (offset + 1 < items.length) {
-          output.next_cursor = mint(offset + 1);
-          output.phase = 'records';
-        } else delete output.next_cursor;
-        return output;
-      }
-      const page: typeof items = [];
-      output.items = page;
-      packItems(
-        page,
-        items.slice(offset, offset + Math.min(input.limit, 100)),
-        INLINE_BUDGET_BYTES,
-        () => {
-          output.returned = page.length;
-          output.has_more = offset + page.length < items.length;
-          output.next_cursor = CURSOR_PLACEHOLDER;
-          return wireBytes(output);
-        },
-      );
-      output.returned = page.length;
-      output.has_more = offset + page.length < items.length;
-      if (output.has_more) output.next_cursor = mint(offset + page.length);
-      else delete output.next_cursor;
-      if (!page.length && offset < items.length) {
-        const record_cursor = mint(offset, 0);
-        const follow_up = {
-          tool: 'sdwis_dataframe_describe',
-          canvas_id: input.canvas_id,
-          ...(input.table_name ? { table_name: input.table_name } : {}),
-          view: 'text',
-          record_cursor,
-        };
-        throw validationError('A complete table metadata item exceeds inline capacity.', {
-          reason: 'item_too_large',
-          record_cursor,
-          follow_up,
-          recovery: { hint: `Read the complete table metadata with ${JSON.stringify(follow_up)}.` },
-        });
-      }
       return output;
     });
   }
   /** Execute once; every continuation reads the same bounded retained result. */
   query(input: QueryInput, ctx: Context) {
+    const { limit, notices } = resolveInlineLimit(input.limit, ctx);
     return this.operation(input.canvas_id, ctx, async (instance, state) => {
       let key: string;
       let offset = 0;
-      let textOffset: number | undefined;
       let entry: CacheEntry;
-      const supplied = input.view === 'text' ? input.record_cursor : input.cursor;
-      if ((input.view === 'text' && !supplied) || (input.view !== 'text' && input.record_cursor))
-        throw validationError('Text view requires record_cursor; records view uses cursor.', {
-          reason: 'cursor_invalid',
-        });
-      if (supplied) {
-        const pointer = this.readCursor(supplied, 'query');
+      if (input.cursor) {
+        const pointer = this.readCursor(input.cursor, 'query');
         const retained = this.cache.get(pointer.entry);
         if (
           !retained ||
@@ -673,8 +600,7 @@ export class CanvasService {
           retained.tenant !== state.tenant ||
           retained.sql !== input.sql ||
           retained.expires <= Date.now() ||
-          pointer.offset > retained.result.rows.length ||
-          (input.view === 'text') !== (pointer.textOffset !== undefined)
+          pointer.offset > retained.result.rows.length
         )
           throw validationError('Query continuation expired or selection changed.', {
             reason: 'cursor_invalid',
@@ -682,7 +608,6 @@ export class CanvasService {
         key = pointer.entry;
         entry = retained;
         offset = pointer.offset;
-        textOffset = pointer.textOffset;
       } else {
         const result = await this.executeQuery(instance, input.sql, ctx.signal);
         ctx.signal.throwIfAborted();
@@ -718,13 +643,15 @@ export class CanvasService {
         };
         this.cache.set(key, entry);
       }
+      const page = entry.result.rows.slice(offset, offset + limit);
+      const hasMore = offset + page.length < entry.result.rows.length;
       const output: SqlOutput = {
         selection_coverage: entry.selection_coverage,
         canvas_id: instance.canvasId,
         pointer: CANVAS_POINTER,
         columns: entry.result.columns,
-        items: [],
-        returned: 0,
+        items: page,
+        returned: page.length,
         row_count: entry.result.rowCount,
         truncated: entry.result.truncated ?? false,
         source_complete: entry.lineage.every((lineage) => lineage.source_complete),
@@ -736,7 +663,7 @@ export class CanvasService {
             ]),
           ).values(),
         ],
-        has_more: false,
+        has_more: hasMore,
         notices: [
           'Source completeness conservatively includes every live source partition in this canvas, including partitions not referenced by this SQL.',
           ...(entry.result.truncated
@@ -744,88 +671,19 @@ export class CanvasService {
                 `The framework retained only ${this.rowLimit} query rows; narrow SQL to retrieve omitted rows.`,
               ]
             : []),
-          ...(input.limit > 100 ? ['Requested limit was clamped to 100.'] : []),
+          ...notices,
         ],
+        ...(hasMore
+          ? {
+              next_cursor: this.mintCursor({
+                kind: 'query',
+                expires: entry.expires,
+                entry: key,
+                offset: offset + page.length,
+              }),
+            }
+          : {}),
       };
-      const mint = (position: number, text?: number) =>
-        this.mintCursor({
-          kind: 'query',
-          expires: entry.expires,
-          entry: key,
-          offset: position,
-          ...(text === undefined ? {} : { textOffset: text }),
-        });
-      if (input.view === 'text') {
-        const row = entry.result.rows[offset];
-        if (!row || textOffset === undefined)
-          throw validationError('Invalid oversized-row continuation.', {
-            reason: 'cursor_invalid',
-          });
-        const points = Array.from(JSON.stringify(row));
-        if (textOffset >= points.length)
-          throw validationError('Invalid oversized-row offset.', { reason: 'cursor_invalid' });
-        const start = textOffset;
-        output.encoding = 'json';
-        output.offset = start;
-        output.record_identity = `${key}:${offset}`;
-        output.text = '';
-        output.next_cursor = CURSOR_PLACEHOLDER;
-        const end = fitTextChunk(points, start, (candidate) => {
-          output.text = points.slice(start, candidate).join('');
-          return wireBytes(output);
-        });
-        if (end === start && end < points.length)
-          throw validationError('Query metadata exceeds inline capacity; narrow SQL.', {
-            reason: 'item_too_large',
-          });
-        output.text = points.slice(start, end).join('');
-        output.has_more = end < points.length || offset + 1 < entry.result.rows.length;
-        if (end < points.length) {
-          output.next_cursor = mint(offset, end);
-          output.phase = 'text';
-        } else if (offset + 1 < entry.result.rows.length) {
-          output.next_cursor = mint(offset + 1);
-          output.phase = 'records';
-        } else delete output.next_cursor;
-      } else {
-        const page: Record<string, unknown>[] = [];
-        output.items = page;
-        output.next_cursor = CURSOR_PLACEHOLDER;
-        packItems(
-          page,
-          entry.result.rows.slice(offset, offset + Math.min(input.limit, 100)),
-          INLINE_BUDGET_BYTES,
-          () => {
-            output.returned = page.length;
-            return wireBytes(output);
-          },
-        );
-        if (!page.length && offset < entry.result.rows.length) {
-          const record_cursor = mint(offset, 0);
-          const follow_up = {
-            tool: 'sdwis_dataframe_query',
-            canvas_id: input.canvas_id,
-            view: 'text',
-            record_cursor,
-          };
-          throw validationError('A complete SQL row exceeds inline capacity.', {
-            reason: 'item_too_large',
-            record_cursor,
-            follow_up,
-            recovery: {
-              hint: `Repeat sdwis_dataframe_query with canvas_id ${input.canvas_id}, the same sql, view text and record_cursor ${record_cursor}.`,
-            },
-          });
-        }
-        output.returned = page.length;
-        output.has_more = offset + page.length < entry.result.rows.length;
-        if (output.has_more) output.next_cursor = mint(offset + page.length);
-        else delete output.next_cursor;
-      }
-      if (wireBytes(output) >= RESPONSE_LIMIT_BYTES)
-        throw validationError('Query metadata exceeds inline capacity; narrow SQL.', {
-          reason: 'item_too_large',
-        });
       return output;
     });
   }

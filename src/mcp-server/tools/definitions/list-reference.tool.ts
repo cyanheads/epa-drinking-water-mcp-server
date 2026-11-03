@@ -69,14 +69,6 @@ export const listReferenceTool = tool('sdwis_list_reference', {
       recovery:
         'Repeat the source tool without cursor or narrow the selection while EPA paging is unstable.',
     },
-    {
-      reason: 'item_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'A full reference description exceeds inline capacity.',
-      recovery:
-        'Repeat this tool with view text and the returned record_cursor to read the complete record in text chunks.',
-    },
   ],
   handler(input, ctx) {
     const type = dynamicReferenceTypes.get(input.topic);

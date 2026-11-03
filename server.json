@@ -23,6 +23,13 @@
           "default": "none"
         },
         {
+          "name": "SDWIS_CLAMP_LIMITS",
+          "description": "Clamp inline row limits above 500 with a notice; false rejects them.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
           "name": "SDWIS_DATAFRAME_DROP_ENABLED",
           "description": "Enable removal of staged tables when DataCanvas is enabled.",
           "format": "string",
@@ -68,6 +75,13 @@
           "format": "string",
           "isRequired": false,
           "default": "none"
+        },
+        {
+          "name": "SDWIS_CLAMP_LIMITS",
+          "description": "Clamp inline row limits above 500 with a notice; false rejects them.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         },
         {
           "name": "SDWIS_DATAFRAME_DROP_ENABLED",

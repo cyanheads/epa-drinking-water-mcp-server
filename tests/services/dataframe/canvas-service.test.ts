@@ -1,7 +1,8 @@
 /** @fileoverview Native DuckDB integration coverage for capability and source-lineage contracts. */
+
+import { databaseError, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { wireBytes } from '@/domain/source-output.js';
 import { CANVAS_POINTER } from '@/services/dataframe/canvas-service.js';
 import { fixture, output } from './canvas-fixtures.js';
 
@@ -28,10 +29,101 @@ async function stage() {
   return f.service.stageRelations({}, output(), [relation], f.ctx);
 }
 function query(canvas_id: string, sql: string, more = {}) {
-  return f.service.query({ canvas_id, sql, view: 'records', limit: 10, ...more }, f.ctx);
+  return f.service.query({ canvas_id, sql, limit: 10, ...more }, f.ctx);
 }
 
 describe('real canvas service', () => {
+  it('executes SQL once when a retained row page is replayed', async () => {
+    const h = await stage();
+    const instance = await f.canvas.acquire(h.canvas_id, f.ctx);
+    vi.spyOn(f.canvas, 'acquire').mockResolvedValue(instance);
+    const execute = vi.spyOn(instance, 'query');
+    const sql = 'SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3';
+    const first = await query(h.canvas_id, sql, { limit: 1 });
+    expect(first.items).toEqual([{ n: 1 }]);
+    const next = await query(h.canvas_id, sql, { limit: 1, cursor: first.next_cursor });
+    expect(next.items).toEqual([{ n: 2 }]);
+    expect((await query(h.canvas_id, sql, { limit: 1, cursor: first.next_cursor })).items).toEqual([
+      { n: 2 },
+    ]);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps unknown engine failures generic and preserves their cause internally', async () => {
+    const h = await stage();
+    const instance = await f.canvas.acquire(h.canvas_id, f.ctx);
+    vi.spyOn(f.canvas, 'acquire').mockResolvedValue(instance);
+    const engine = vi.spyOn(instance, 'query');
+    for (const cause of [
+      new Error('INTERNAL_CANARY /private/engine'),
+      databaseError('INTERNAL_CANARY /private/engine', {
+        reason: 'engine_internal',
+        secret: 'SECRET_CANARY',
+      }),
+    ]) {
+      engine.mockRejectedValueOnce(cause);
+      const failure: unknown = await query(h.canvas_id, 'SELECT 1').catch(
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(McpError);
+      expect(failure).toMatchObject({
+        cause,
+        data: { recovery: { hint: expect.stringContaining('sdwis_dataframe_query') } },
+      });
+      if (!(failure instanceof McpError)) throw new Error('Expected a typed engine failure.');
+      expect(JSON.stringify({ message: failure.message, data: failure.data })).not.toContain(
+        'INTERNAL_CANARY',
+      );
+      expect(JSON.stringify(failure.data)).not.toContain('SECRET_CANARY');
+    }
+  });
+
+  it('continues describe records across idle time without changing their selection', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const h = await f.service.stageRelations(
+      {},
+      output(true),
+      [relation, { ...relation, relation: 'second' }],
+      f.ctx,
+    );
+    const first = await f.service.describe({ canvas_id: h.canvas_id, limit: 1 }, f.ctx);
+    vi.setSystemTime(Date.now() + 10000);
+    const second = await f.service.describe(
+      { canvas_id: h.canvas_id, limit: 1, cursor: first.next_cursor },
+      f.ctx,
+    );
+    expect(second).toMatchObject({ returned: 1, totalCount: 2, has_more: false });
+    expect(second.items[0]?.table_name).not.toBe(first.items[0]?.table_name);
+  });
+
+  it.each(['schema', 'lineage', 'added table'])(
+    'rejects describe continuation after a change to %s',
+    async (change) => {
+      const source = output(true);
+      const h = await f.service.stageRelations(
+        {},
+        source,
+        [relation, { ...relation, relation: 'second' }],
+        f.ctx,
+      );
+      const first = await f.service.describe({ canvas_id: h.canvas_id, limit: 1 }, f.ctx);
+      if (change === 'schema') {
+        const instance = await f.canvas.acquire(h.canvas_id, f.ctx);
+        await instance.registerTable(h.table_name, [{ replacement: 1 }], {
+          schema: [{ name: 'replacement', type: 'INTEGER', nullable: false }],
+          ttlMs: 3600000,
+        });
+      } else if (change === 'lineage') {
+        source.provenance.consistency = 'changed source revision';
+      } else {
+        await f.service.stageRelations({ canvas_id: h.canvas_id }, source, [relation], f.ctx);
+      }
+      await expect(
+        f.service.describe({ canvas_id: h.canvas_id, limit: 1, cursor: first.next_cursor }, f.ctx),
+      ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
+    },
+  );
+
   it('marks coverage incomplete when an earlier partition expires before the final partition', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const now = Date.now();
@@ -190,7 +282,6 @@ describe('real canvas service', () => {
     do {
       const page = await f.service.describe({ canvas_id: h.canvas_id, limit: 3, cursor }, f.ctx);
       expect(page.totalCount).toBe(16);
-      expect(wireBytes(page)).toBeLessThan(24000);
       expect(
         page.items.every((item) => Array.isArray(item.columns) && item.columns.length === 2),
       ).toBe(true);
@@ -198,10 +289,11 @@ describe('real canvas service', () => {
       cursor = page.next_cursor;
     } while (cursor);
     expect(new Set(names).size).toBe(16);
-    expect(await f.service.describe({ canvas_id: h.canvas_id, limit: 101 }, f.ctx)).toMatchObject({
+    expect(await f.service.describe({ canvas_id: h.canvas_id, limit: 501 }, f.ctx)).toMatchObject({
       totalCount: 16,
-      has_more: true,
-      notices: ['Requested limit was clamped to 100.'],
+      returned: 16,
+      has_more: false,
+      notices: ['Requested limit 501 exceeds the maximum 500; clamped to 500.'],
     });
     const first = await f.service.describe({ canvas_id: h.canvas_id, limit: 1 }, f.ctx);
     await f.service.drop(h, f.ctx);
@@ -215,53 +307,34 @@ describe('real canvas service', () => {
       ),
     ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
   });
-  it('rejects forged, foreign and mode-incompatible SQL positions while retaining valid text replay after drop', async () => {
+  it('rejects forged and foreign SQL positions while retaining whole-row replay after drop', async () => {
     const h = await stage();
     const foreign = await stage();
     const value = '💧'.repeat(4000);
     const sql = `SELECT '${value}' AS value UNION ALL SELECT 'last'`;
-    const error = (await query(h.canvas_id, sql).catch((cause: unknown) => cause)) as {
-      data: { record_cursor: string };
-    };
-    const record_cursor = error.data.record_cursor;
+    const first = await query(h.canvas_id, sql, { limit: 1 });
+    expect(first.items).toEqual([{ value }]);
     await f.service.drop(h, f.ctx);
-    const first = await query(h.canvas_id, sql, { view: 'text', record_cursor });
-    expect(await query(h.canvas_id, sql, { view: 'text', record_cursor })).toEqual(first);
-    expect(
-      await query(h.canvas_id, sql, { view: 'text', record_cursor, cursor: 'ignored-old-page' }),
-    ).toEqual(first);
-    expect(wireBytes(first)).toBeLessThan(24000);
-    for (const args of [
-      { cursor: record_cursor },
-      { view: 'text', record_cursor: `${record_cursor}x` },
-    ])
-      await expect(query(h.canvas_id, sql, args)).rejects.toMatchObject({
-        data: { reason: 'cursor_invalid' },
-      });
+    const next = await query(h.canvas_id, sql, { cursor: first.next_cursor });
+    expect(next.items).toEqual([{ value: 'last' }]);
+    expect(await query(h.canvas_id, sql, { cursor: first.next_cursor })).toEqual(next);
     await expect(
-      query(foreign.canvas_id, sql, { view: 'text', record_cursor }),
+      query(h.canvas_id, sql, { cursor: `${first.next_cursor}x` }),
+    ).rejects.toMatchObject({
+      data: { reason: 'cursor_invalid' },
+    });
+    await expect(
+      query(foreign.canvas_id, sql, { cursor: first.next_cursor }),
     ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
     await expect(
       f.service.query(
-        { canvas_id: h.canvas_id, sql, view: 'text', record_cursor, limit: 10 },
+        { canvas_id: h.canvas_id, sql, cursor: first.next_cursor, limit: 10 },
         createMockContext({ tenantId: 'foreign' }),
       ),
     ).rejects.toMatchObject({ data: { reason: 'canvas_not_found' } });
-    let next = first;
-    let text = String(first.text);
-    while (next.phase === 'text') {
-      next = await query(h.canvas_id, sql, { view: 'text', record_cursor: next.next_cursor });
-      expect(wireBytes(next)).toBeLessThan(24000);
-      text += next.text;
-    }
-    expect(JSON.parse(text)).toEqual({ value });
-    expect(next.phase).toBe('records');
-    expect((await query(h.canvas_id, sql, { cursor: next.next_cursor })).items).toEqual([
-      { value: 'last' },
-    ]);
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(Date.now() + 900001);
-    await expect(query(h.canvas_id, sql, { view: 'text', record_cursor })).rejects.toMatchObject({
+    await expect(query(h.canvas_id, sql, { cursor: first.next_cursor })).rejects.toMatchObject({
       data: { reason: 'cursor_invalid' },
     });
   });
@@ -410,35 +483,18 @@ describe('real canvas service', () => {
       returned: 1,
       has_more: false,
     });
-    expect(wireBytes(first)).toBeLessThan(24000);
     await expect(
       query(h.canvas_id, 'SELECT 2', { cursor: first.next_cursor }),
     ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
   });
 
-  it('reconstructs oversized Unicode rows through exact text chunks', async () => {
+  it('preserves oversized Unicode rows as complete items', async () => {
     const h = await stage();
     const value = '💧"\\\n'.repeat(1800);
     const sql = `SELECT '${value.replaceAll("'", "''")}' AS value`;
-    let cursor: string | undefined;
-    try {
-      await query(h.canvas_id, sql);
-      throw new Error('Expected oversized row');
-    } catch (error) {
-      expect(error).toMatchObject({ data: { reason: 'item_too_large' } });
-      cursor = (error as { data: { record_cursor: string } }).data.record_cursor;
-    }
-    let text = '';
-    let offset = 0;
-    do {
-      const page = await query(h.canvas_id, sql, { view: 'text', record_cursor: cursor });
-      expect(page.offset).toBe(offset);
-      expect(wireBytes(page)).toBeLessThan(24000);
-      text += page.text;
-      offset += Array.from(page.text ?? '').length;
-      cursor = page.next_cursor;
-    } while (cursor);
-    expect(JSON.parse(text)).toEqual({ value });
+    const page = await query(h.canvas_id, sql);
+    expect(page.items).toEqual([{ value }]);
+    expect(page).toMatchObject({ returned: 1, has_more: false });
   });
 
   it('reserves simultaneous mint slots atomically and frees expired capacity', async () => {
@@ -504,6 +560,13 @@ describe('real canvas service', () => {
       has_more: true,
     });
     expect((await query(h.canvas_id, 'SELECT 1 WHERE false')).items).toEqual([]);
+    expect(await query(h.canvas_id, `SELECT * FROM ${h.table_name} OFFSET 10`)).toMatchObject({
+      items: [],
+      returned: 0,
+      row_count: 0,
+      has_more: false,
+      truncated: false,
+    });
   });
 
   it('pages describe metadata and binds its cursor to the exact table selection', async () => {
@@ -551,7 +614,7 @@ describe('real canvas service', () => {
     const controllers = Array.from({ length: 6 }, () => new AbortController());
     const jobs = controllers.map((controller) =>
       f.service.query(
-        { canvas_id: h.canvas_id, sql: 'SELECT 1 AS value', view: 'records', limit: 10 },
+        { canvas_id: h.canvas_id, sql: 'SELECT 1 AS value', limit: 10 },
         createMockContext({ signal: controller.signal }),
       ),
     );
@@ -574,7 +637,7 @@ describe('real canvas service', () => {
     const h = await stage();
     const controller = new AbortController();
     const pending = f.service.query(
-      { canvas_id: h.canvas_id, sql: 'SELECT 1', view: 'records', limit: 10 },
+      { canvas_id: h.canvas_id, sql: 'SELECT 1', limit: 10 },
       createMockContext({ signal: controller.signal }),
     );
     controller.abort(new DOMException('Active fixture cancelled', 'AbortError'));

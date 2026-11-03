@@ -11,12 +11,18 @@ import { produceSource } from '@/services/sdwis/drinking-water-service.js';
 /** Find public systems before selecting profiles or historical fact records. */
 export const searchWaterSystemsTool = tool('sdwis_search_water_systems', {
   description:
-    'Find public water systems by name, PWSID, reported legal-entity state, county served, population, activity or source. Supply at least one narrowing selector. Discovery defaults to active systems; activity all includes inactive inventory. State and county matches do not establish complete physical service boundaries. Pass a returned PWSID to sdwis_get_system_profile; continue incomplete selections with the same filters and next_cursor.',
+    'Find public water systems by name, PWSID, reported legal-entity state, county served, population, activity, source or school/daycare indicator. Supply at least one narrowing selector. Discovery defaults to active systems; activity all includes inactive inventory. School/daycare and wholesaler indicators are reported system attributes, not an inventory of every institution receiving water. State and county matches do not establish complete physical service boundaries. Pass a returned PWSID to sdwis_get_system_profile; continue incomplete selections with the same filters and next_cursor.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     ...geographyFields,
     ...pagingFields,
     name_contains: optionalText('Case-insensitive substring of the reported system name.'),
+    school_or_daycare: z
+      .boolean()
+      .optional()
+      .describe(
+        'Exact reported school/daycare indicator: true selects Y and false N; unknown source indicators match neither.',
+      ),
     population_min: z
       .number()
       .int()
@@ -86,14 +92,6 @@ export const searchWaterSystemsTool = tool('sdwis_search_water_systems', {
       recovery:
         'Repeat the source tool without cursor or narrow the selection while EPA paging is unstable.',
     },
-    {
-      reason: 'item_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'One complete public record exceeds the inline wire budget.',
-      recovery:
-        'Repeat this tool with view text and the returned record_cursor to read the complete record in text chunks.',
-    },
   ],
   handler(input, ctx) {
     if (
@@ -106,6 +104,7 @@ export const searchWaterSystemsTool = tool('sdwis_search_water_systems', {
         input.system_type,
         input.primacy_agency,
         input.pwsid_prefix,
+        input.school_or_daycare,
         input.population_min,
         input.population_max,
       ].some((value) => value !== undefined)

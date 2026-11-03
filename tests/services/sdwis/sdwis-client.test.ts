@@ -2,6 +2,7 @@
  * @fileoverview DMAP retry, projection, abort and upstream contract boundaries.
  * @module tests/services/sdwis/sdwis-client.test
  */
+import process from 'node:process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { network, paced } from './sdwis-fixtures.js';
 
@@ -32,6 +33,125 @@ function read(caller = signal()) {
 }
 
 describe('DMAP network boundary', () => {
+  it('preserves accepted selector normalization and rejects embedded controls', async () => {
+    const { normalizeSelectors } = await import('../../../src/domain/source-inputs.js');
+    expect(
+      normalizeSelectors({
+        pwsid: ' wa1234567 ',
+        state: 'Washington',
+        county: 'King County',
+        name_contains: ' AB-12 ',
+        action_type: 'unknown_code',
+      }),
+    ).toEqual({
+      pwsid: 'WA1234567',
+      state: 'WA',
+      state_basis: 'reported_legal_entity',
+      county: 'KING',
+      name_contains: 'AB-12',
+      action_type: 'UNKNOWN_CODE',
+    });
+    expect(() => normalizeSelectors({ name_contains: 'A\nB' })).toThrow(
+      'Selector contains path or control characters.',
+    );
+  });
+  it.each(['SO+', "DIXIE'S", 'ST. CLAIR', 'SF%', 'EF/', 'A_B', 'A,B', 'A\n', 'A\r\nB'])(
+    'rejects grammar-unsafe contains value %j before HTTP',
+    async (value) => {
+      await expect(
+        client.readPage(
+          'water_system',
+          [{ column: 'pws_name', operator: 'contains', value }],
+          1,
+          1,
+          signal(),
+        ),
+      ).rejects.toMatchObject({ data: { reason: 'invalid_selector' } });
+      expect(http.calls).toEqual([]);
+    },
+  );
+  it('keeps safe exact underscores, comma-separated in values and normal substring predicates', async () => {
+    const predicates = [
+      { column: 'pwsid', operator: 'in' as const, value: 'WA1234567,WA1234568' },
+      { column: 'pws_name', operator: 'equals' as const, value: 'A_B-12' },
+    ];
+    http = network([
+      {
+        path: '/dmapservice/sdwis.water_system/pwsid/in/WA1234567%2CWA1234568/and/pws_name/equals/A_B-12/sort/pwsid/1:1/json',
+        rows: [{ pwsid: 'WA1234567', pws_name: 'A_B-12' }],
+      },
+    ]);
+    expect(client.pushdownPredicates(predicates)).toEqual(predicates);
+    expect((await paced(client.readPage('water_system', predicates, 1, 1, signal()))).rows).toEqual(
+      [{ pwsid: 'WA1234567', pws_name: 'A_B-12' }],
+    );
+  });
+  it('rechecks only a pushed superset and leaves the full literal match to the caller', async () => {
+    const literal = [{ column: 'pws_name', operator: 'contains' as const, value: 'A_B' }];
+    const pushed = client.pushdownPredicates(literal);
+    expect(pushed).toEqual([{ column: 'pws_name', operator: 'contains', value: 'A' }]);
+    http = network([
+      {
+        path: '/dmapservice/sdwis.water_system/pws_name/contains/A/sort/pwsid/1:1/json',
+        rows: [{ pwsid: 'WA1234567', pws_name: 'MARBLE' }],
+      },
+    ]);
+    const page = await paced(client.readPage('water_system', pushed, 1, 1, signal()));
+    expect(client.matchesPredicates(page.rows[0]!, literal)).toBe(false);
+    http.verify();
+    http = network([
+      {
+        path: '/dmapservice/sdwis.water_system/pws_name/contains/A/sort/pwsid/2:2/json',
+        rows: [{ pwsid: 'WA1234568', pws_name: 'OTHER' }],
+      },
+    ]);
+    await expect(
+      paced(client.readPage('water_system', pushed, 2, 1, signal())),
+    ).rejects.toMatchObject({ data: { reason: 'upstream_contract_changed' } });
+  });
+  it('chooses a trimmed longest run and an underscore-free leading prefix without wildcard leaks', () => {
+    expect(
+      client.pushdownPredicates([
+        { column: 'pws_name', operator: 'contains', value: '  #    AB CD   #EF  ' },
+        { column: 'enforcement_action_type_code', operator: 'equals', value: 'A_B+' },
+        { column: 'county_served', operator: 'equals', value: '/#%' },
+        { column: 'pws_name', operator: 'contains', value: ' #\r\n/# ' },
+      ]),
+    ).toEqual([
+      { column: 'pws_name', operator: 'contains', value: 'AB CD' },
+      { column: 'enforcement_action_type_code', operator: 'beginsWith', value: 'A' },
+    ]);
+  });
+  it('keeps unsafe selector scans below quadratic growth over a 64-fold input span', () => {
+    const measurements = [5000, 10000, 20000, 40000, 80000, 160000, 320000].map((length) => {
+      const values = [
+        'A'.repeat(length) + '!',
+        'A'.repeat(length) + '\n',
+        ' \r\n'.repeat(Math.ceil(length / 3)),
+        '/#%('.repeat(Math.ceil(length / 4)),
+        'A_('.repeat(Math.ceil(length / 3)),
+        ' '.repeat(length) + '!ABC',
+      ];
+      const predicates = values.flatMap((value) => [
+        { column: 'pws_name', operator: 'contains' as const, value },
+        { column: 'county_served', operator: 'equals' as const, value },
+      ]);
+      for (let i = 0; i < 5; i++) client.pushdownPredicates(predicates);
+      const start = process.threadCpuUsage();
+      for (let i = 0; i < 10; i++) client.pushdownPredicates(predicates);
+      const cpu = process.threadCpuUsage(start);
+      const used = cpu.user + cpu.system;
+      expect(used).toBeLessThan(500000);
+      return used;
+    });
+    console.info('Selector scan thread CPU microseconds:', measurements);
+    expect(measurements[6]! / Math.max(measurements[0]!, 1)).toBeLessThan(256);
+    expect(
+      client.pushdownPredicates([
+        { column: 'pws_name', operator: 'contains', value: '/#%('.repeat(20000) + 'LONGEST' },
+      ]),
+    ).toEqual([{ column: 'pws_name', operator: 'contains', value: 'LONGEST' }]);
+  });
   it('accepts a fully read empty JSON array as an exhausted page on the first attempt', async () => {
     http = network([{ path, response: () => new Response('[]') }]);
     expect((await paced(read())).rows).toEqual([]);

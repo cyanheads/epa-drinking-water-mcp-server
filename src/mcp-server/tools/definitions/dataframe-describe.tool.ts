@@ -5,6 +5,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { inlineLimit } from '@/domain/inline-limit.js';
 import { optionalText } from '@/domain/source-inputs.js';
 import { formatSource, selectionCoverageSchema } from '@/domain/source-output.js';
 import { getCanvasService } from '@/services/dataframe/canvas-service.js';
@@ -12,23 +13,15 @@ import { getCanvasService } from '@/services/dataframe/canvas-service.js';
 /** Inspect only the explicit caller-held canvas; no global canvas listing exists. */
 export const dataframeDescribeTool = tool('sdwis_dataframe_describe', {
   description:
-    'Inspect live table names, column types, row counts, source filters, provenance, completeness, continuation and expiry inside a canvas_id you already hold. Results page whole tables, each with its complete columns array. Oversized tables are available as lossless JSON text chunks. UCMR additional elements join occurrence by pwsid, facility_id, sample_point_id and sample_event_code; service ZIP membership joins by pwsid and is not sample location.',
+    'Inspect live table names, column types, row counts, source filters, provenance, completeness, continuation and expiry inside a canvas_id you already hold. Results page whole tables, each with its complete columns array. UCMR additional elements join occurrence by pwsid, facility_id, sample_point_id and sample_event_code; service ZIP membership joins by pwsid and is not sample location.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
-  input: z.object({
+  input: z.strictObject({
     canvas_id: CanvasIdSchema,
     table_name: optionalText('Optional exact table name within this canvas.'),
     cursor: optionalText('Continuation from this exact describe selection.'),
-    view: z
-      .enum(['records', 'text'])
-      .default('records')
-      .describe('Whole tables or lossless oversized-table JSON text.'),
-    record_cursor: optionalText('Oversized-table text continuation from this exact selection.'),
-    limit: z
-      .number()
-      .int()
-      .positive()
-      .default(10)
-      .describe('Tables requested; clamped to 100 with a notice.'),
+    limit: inlineLimit.describe(
+      'Whole tables requested; defaults to 10, with an effective maximum of 500.',
+    ),
   }),
   output: z.object({
     selection_coverage: selectionCoverageSchema,
@@ -41,22 +34,9 @@ export const dataframeDescribeTool = tool('sdwis_dataframe_describe', {
       ),
     returned: z.number().int().describe('Whole tables in this response.'),
     totalCount: z.number().int().describe('Current matching tables.'),
-    has_more: z.boolean().describe('More tables or table text remain.'),
-    next_cursor: optionalText(
-      'Next whole table or text chunk; use phase to choose cursor or record_cursor.',
-    ),
+    has_more: z.boolean().describe('More whole tables remain.'),
+    next_cursor: optionalText('Next page of whole tables in this selection.'),
     notices: z.array(z.string()).describe('Paging guidance.'),
-    encoding: z
-      .literal('json')
-      .optional()
-      .describe('Concatenate text chunks to reconstruct the complete table item.'),
-    text: z.string().optional().describe('Lossless oversized-table JSON text.'),
-    offset: z.number().int().optional().describe('Unicode code-point offset.'),
-    record_identity: z.string().optional().describe('Exact live table metadata identity.'),
-    phase: z
-      .enum(['records', 'text'])
-      .optional()
-      .describe('Use next_cursor as cursor for records or record_cursor for text.'),
   }),
   errors: [
     {
@@ -65,15 +45,7 @@ export const dataframeDescribeTool = tool('sdwis_dataframe_describe', {
       thrownBy: 'service',
       when: 'A continuation is invalid, expired, or its live table metadata or exact selector changed.',
       recovery:
-        'Repeat sdwis_dataframe_describe with the original canvas_id and table_name, omitting cursor and record_cursor.',
-    },
-    {
-      reason: 'item_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'A complete table metadata item cannot fit inline.',
-      recovery:
-        'Repeat sdwis_dataframe_describe with view text, the returned record_cursor, and the same canvas_id and table_name.',
+        'Repeat sdwis_dataframe_describe with the original canvas_id and table_name, omitting cursor.',
     },
     {
       reason: 'canvas_capacity_exhausted',

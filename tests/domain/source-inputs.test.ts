@@ -3,7 +3,12 @@
 import process from 'node:process';
 import { z } from '@cyanheads/mcp-ts-core';
 import { describe, expect, it } from 'vitest';
-import { dateFields, geographyFields, normalizeSelectors } from '@/domain/source-inputs.js';
+import {
+  dateFields,
+  geographyFields,
+  normalizeSelectors,
+  pagingFields,
+} from '@/domain/source-inputs.js';
 import { getEnforcementActionsTool } from '@/mcp-server/tools/definitions/get-enforcement-actions.tool.js';
 import { getSystemProfileTool } from '@/mcp-server/tools/definitions/get-system-profile.tool.js';
 import { getViolationsTool } from '@/mcp-server/tools/definitions/get-violations.tool.js';
@@ -20,6 +25,16 @@ function pattern(input: z.ZodType, field: string) {
 }
 
 describe('raw source selector compatibility', () => {
+  it('rejects removed text-recovery inputs while retaining row continuations', () => {
+    const input = z.strictObject(pagingFields);
+    expect(input.parse({ cursor: 'held-position', limit: 500 })).toEqual({
+      cursor: 'held-position',
+      limit: 500,
+    });
+    expect(input.safeParse({ view: 'records' }).success).toBe(false);
+    expect(input.safeParse({ view: 'text', record_cursor: 'held-record' }).success).toBe(false);
+    expect(input.safeParse({ record_cursor: 'held-record' }).success).toBe(false);
+  });
   it('advertises raw optional and required ID forms without regex flags', () => {
     const optional = z.toJSONSchema(z.object(geographyFields), { io: 'input' }).properties?.pwsid;
     const required = z.toJSONSchema(getSystemProfileTool.input, { io: 'input' }).properties?.pwsid;

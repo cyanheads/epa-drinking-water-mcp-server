@@ -1,6 +1,6 @@
 # epa-drinking-water-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 04:08:20
+Generated on: 2026-11-03 21:08:43
 
 ```text
 epa-drinking-water-mcp-server/
@@ -136,10 +136,14 @@ epa-drinking-water-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── epa-drinking-water-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
 │   ├── domain/
+│   │   ├── inline-limit.ts
 │   │   ├── reference.ts
 │   │   ├── sdwis-contracts.ts
 │   │   ├── source-inputs.ts
@@ -175,6 +179,7 @@ epa-drinking-water-mcp-server/
 │   └── index.ts
 ├── tests/
 │   ├── domain/
+│   │   ├── inline-limit.test.ts
 │   │   ├── sdwis-contracts.test.ts
 │   │   └── source-inputs.test.ts
 │   ├── fuzz/
