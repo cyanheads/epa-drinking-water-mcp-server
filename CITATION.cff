@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: epa-drinking-water-mcp-server
+abstract: "Search EPA drinking water systems, violations, enforcement actions, and contaminant measurements via MCP. STDIO or Streamable HTTP."
+type: software
+authors:
+  - family-names: Hand
+    given-names: Casey
+    orcid: "https://orcid.org/0009-0009-3726-568X"
+repository-code: "https://github.com/cyanheads/epa-drinking-water-mcp-server"
+license: Apache-2.0
+doi: 10.5281/zenodo.24193672
+keywords:
+  - mcp
+  - model-context-protocol
+  - epa
+  - drinking-water
+  - sdwis
+  - ucmr
+  - pfas
+  - water-quality
