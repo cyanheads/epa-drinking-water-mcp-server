@@ -2,8 +2,8 @@
 
 **Server:** epa-drinking-water-mcp-server
 **Version:** 0.3.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 
 Read `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` for framework APIs. Read `docs/design.md` before changing source contracts. Run `bun run list-skills` and read the matching `framework-skills/<skill>/SKILL.md` before task work.
 
@@ -82,6 +82,8 @@ Describe continuation identity excludes sliding expiry while retaining its origi
 `SDWIS_DATAFRAME_DROP_ENABLED=true` additionally enables table removal. Missing tables and expired canvases return `dropped:false`.
 
 MCPB strips native bindings and explicitly fixes `CANVAS_PROVIDER_TYPE=none`, with no SQL toggle. Keep all six EPA tools usable without native modules; staging fails `canvas_disabled`. npm plugin options must reach the server through Codex `env_vars` or Claude `userConfig` substitutions.
+
+Keep MCPB exclusions root-anchored. `scripts/clean-mcpb.ts` strips dependency agent docs at package roots and preserves runtime modules such as the framework's `dist/ext/skills/`.
 
 Keep package, registry, MCPB, plugin, Docker, and README identities synchronized. The package description is canonical; registry description is a condensed maximum of 100 characters. Exclude `docs/idea.md` from git, npm, Docker, and MCPB.
 
