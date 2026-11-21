@@ -2,12 +2,7 @@
  * @fileoverview Fixed-origin, paced DMAP reads with one deadline and public projection.
  * @module services/sdwis/sdwis-client
  */
-import {
-  JsonRpcErrorCode,
-  McpError,
-  serviceUnavailable,
-  validationError,
-} from '@cyanheads/mcp-ts-core/errors';
+import { McpError, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
 import {
   type PublicRow,
   parseRows,
@@ -15,6 +10,7 @@ import {
   type Table,
   tableSchemas,
 } from '@/domain/sdwis-contracts.js';
+import { discardEpaBody, epaHttpError } from '@/services/epa-http-error.js';
 
 const operators = [
   'equals',
@@ -195,7 +191,7 @@ export async function readPage(
       const attemptSignal = AbortSignal.any([signal, AbortSignal.timeout(15000)]);
       response = await fetch(url, { signal: attemptSignal, redirect: 'manual' });
       if (!response.ok) {
-        await response.body?.cancel();
+        await discardEpaBody(response, signal);
         const retryAfter = response.headers.get('retry-after');
         if (retryAfter) {
           const seconds = Number(retryAfter);
@@ -207,20 +203,8 @@ export async function readPage(
             ),
           );
         }
-        const retryable = [408, 429, 500, 502, 503, 504].includes(response.status);
-        const code =
-          response.status === 403
-            ? JsonRpcErrorCode.Forbidden
-            : response.status === 429
-              ? JsonRpcErrorCode.RateLimited
-              : response.status === 408
-                ? JsonRpcErrorCode.Timeout
-                : JsonRpcErrorCode.ServiceUnavailable;
-        const error = new McpError(code, `EPA DMAP request failed with HTTP ${response.status}.`, {
-          status: response.status,
-          retryable,
-        });
-        if (!retryable) throw error;
+        const error = await epaHttpError(response, 'DMAP');
+        if (!error.data?.retryable) throw error;
         lastFailure = error;
         text = '';
       } else {
@@ -268,7 +252,9 @@ export async function readPage(
   }
   signal.throwIfAborted();
   if (lastFailure instanceof McpError) throw lastFailure;
-  throw serviceUnavailable('EPA DMAP could not complete after three attempts.', undefined, {
-    cause: lastFailure,
-  });
+  throw serviceUnavailable(
+    'EPA DMAP could not complete after three attempts.',
+    { reason: 'upstream_unavailable', retryable: true },
+    { cause: lastFailure },
+  );
 }

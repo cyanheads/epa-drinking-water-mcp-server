@@ -54,7 +54,8 @@ The published [caller guide](./skills/epa-drinking-water-guide/SKILL.md) covers 
 
 ### `sdwis_search_water_systems` <sub>tool</sub>
 
-- At least one narrowing selector: `pwsid`, `name_contains`, `state`, `county` (requires state), `population_min` / `population_max`, `source`, `system_type`, `school_or_daycare`, `primacy_agency`, or `pwsid_prefix`; names match literal case-insensitive substrings and counties match normalized names exactly, including punctuation
+- At least one narrowing selector: `pwsid`, `seller_pwsid`, `name_contains`, `state`, `county` (requires state), `population_min` / `population_max`, `source`, `system_type`, `school_or_daycare`, `primacy_agency`, or `pwsid_prefix`; names match literal case-insensitive substrings and counties match normalized names exactly, including punctuation
+- `seller_pwsid` finds distinct buyers whose facility records name the seller. Inactive facility connections count. The `activity` filter applies to the buyer system.
 - `activity` defaults to `active`; choose `inactive` or `all` explicitly. State means reported legal-entity state; county means county served, and neither establishes complete physical service boundaries
 - `school_or_daycare:true` selects reported `Y`, false selects `N`; unknown indicators match neither. Discovery and profile summaries preserve school/daycare and wholesaler source indicators; this is not an inventory of every school receiving public water
 
@@ -71,6 +72,7 @@ The published [caller guide](./skills/epa-drinking-water-guide/SKILL.md) covers 
 ### `sdwis_get_violations` <sub>tool</sub>
 
 - Require `pwsid` or `state`; optional `county`, `contaminant`, `category`, `health_based`, and `compliance_status`
+- Violation rows pair compliance status and rule codes with EPA labels. For example, select `R` for Returned to Compliance. A completed empty selection can identify a supplied code missing from the EPA dictionary.
 - Inclusive `date_from` / `date_to` select compliance-period overlap; a known endpoint can prove overlap despite a missing endpoint. Indeterminate periods are excluded with a count of affected rows examined during the call. Monitoring/reporting violations may lack concentrations
 - `contaminant:lead` selects `1030` and Lead and Copper Rule code `5000`, including copper and monitoring records; either exact code selects only itself
 - `stage:true` requests a partition; `stage_max_rows` defaults to 5,000 and clamps at 25,000. Supply a held `canvas_id` to add another partition
@@ -90,6 +92,7 @@ The published [caller guide](./skills/epa-drinking-water-guide/SKILL.md) covers 
 - Actions require `pwsid` or reported legal-entity `state`, with optional state-qualified `county`; geographic membership resolves before action retrieval. `section:associations` and any `violation_id` filter require `pwsid`; supplied geography still intersects that system
 - `action_type`, `originator`, and inclusive enforcement-date filters apply only to actions. Associations page separately; source action text does not imply a federal order or monetary penalty
 - Action types match the complete published code exactly and case-insensitively, including punctuation; missing dictionary labels remain null
+- `originator_label` gives EPA’s description of the action’s `originator_code`.
 - Supports `stage`, `canvas_id`, and `stage_max_rows` (5,000 default, 25,000 maximum)
 
 ---
@@ -97,7 +100,7 @@ The published [caller guide](./skills/epa-drinking-water-guide/SKILL.md) covers 
 ### `sdwis_dataframe_describe` <sub>tool</sub>
 
 - Required caller-held `canvas_id`; optional exact `table_name`; `limit` defaults to 10 with a cap of 500 and `cursor` pagination
-- One whole table per item includes its `columns` array, row count, expiry, filters, provenance, completeness, and continuation; counts and limits are in tables. There is no global canvas listing
+- One whole table per item includes its `columns` array, row count, expiry, filters, provenance, completeness, and continuation. Each column includes the normalized `type` and DuckDB's exact `engineType` when reported
 - Describe continuations retain their original deadline (at most 15 minutes or table expiry when issued) and reject changed membership, rows, schema, or lineage. Query-driven TTL extensions preserve cursor identity; responses report current authoritative expiry
 - `selection_coverage` reports which source partitions and required companion relations remain staged, separately from SQL results
 
@@ -108,6 +111,7 @@ The published [caller guide](./skills/epa-drinking-water-guide/SKILL.md) covers 
 - Required `canvas_id` and one read-only SELECT, WITH, or FROM statement in `sql` (at most 20,000 characters); describe the canvas first
 - Retains at most `CANVAS_DEFAULT_ROW_LIMIT` (framework default 10,000), bounded by 25,000. `row_count`, `truncated`, and `has_more` distinguish retained rows from omitted rows; continuations read an immutable result for up to 15 minutes
 - File, network, write, and system-catalog access are refused. `source_complete` conservatively includes every live source partition, including tables the SQL does not reference
+- Choose column aliases and CTE names distinct from DuckDB metadata view names
 - Known caller-correctable SQL errors preserve path-redacted diagnostics and structured details; unknown engine/database failures remain generic
 - `selection_coverage.chain_complete` confirms the canvas holds a complete source retrieval chain; it does not establish which tables the SQL uses or override `truncated`. Query continuations retain the original coverage snapshot
 
@@ -126,6 +130,7 @@ EPA-specific:
 
 - Keyless SDWIS reads over EPA DMAP, paced at one request per second, with every returned row rechecked against the requested predicates
 - Contact-free inventory and service membership; source codes kept alongside EPA dictionary labels, which stay null when EPA has none
+- Geographic analyses can reuse completed reported-state or state-and-county membership for one hour. A notice dates the reused membership. Each selection retrieves its own fact rows.
 - Quarterly SDWIS records, LCR summaries, and limited-participation UCMR 5 monitoring kept distinct; empty results establish neither current compliance, tap-water safety, nor contaminant absence
 - UCMR 5 archive downloaded and indexed once per published revision on first use; censored results keep a null value with the reporting limit
 
@@ -173,7 +178,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 - Network access to `data.epa.gov` and `www.epa.gov`; allow a 180-second client timeout for the first UCMR call, which downloads and indexes the archive.
 
 ### Installation

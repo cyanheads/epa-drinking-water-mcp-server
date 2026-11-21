@@ -28,6 +28,7 @@ interface Job {
   ids: ReadonlySet<string>;
   membershipCursor?: string;
   membershipDone: boolean;
+  membershipReuseNotice?: string;
   offset: number;
   partition: number;
   pending: Ucmr5Occurrence[];
@@ -183,7 +184,9 @@ export function createUcmrProducer(
           current.membershipDone = membership.source_complete;
           current.ids = membership.pwsids;
           if (membership.next_cursor) current.membershipCursor = membership.next_cursor;
+          if (membership.reuseNotice) current.membershipReuseNotice = membership.reuseNotice;
         }
+        if (current.membershipReuseNotice) result.notices.push(current.membershipReuseNotice);
         if (!current.membershipDone) {
           result.phase = 'membership';
           result.next_cursor = mint(current);

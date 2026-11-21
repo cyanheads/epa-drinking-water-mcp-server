@@ -1,6 +1,6 @@
 # epa-drinking-water-mcp-server - Directory Structure
 
-Generated on: 2026-11-03 21:30:18
+Generated on: 2026-11-21 16:51:58
 
 ```text
 epa-drinking-water-mcp-server/
@@ -147,6 +147,7 @@ epa-drinking-water-mcp-server/
 │   │   ├── inline-limit.ts
 │   │   ├── reference.ts
 │   │   ├── sdwis-contracts.ts
+│   │   ├── sdwis-label-columns.ts
 │   │   ├── source-inputs.ts
 │   │   ├── source-output.ts
 │   │   └── ucmr5-schemas.ts
@@ -171,12 +172,14 @@ epa-drinking-water-mcp-server/
 │   │   │   └── canvas-service.ts
 │   │   ├── sdwis/
 │   │   │   ├── drinking-water-service.ts
-│   │   │   └── sdwis-client.ts
-│   │   └── ucmr5/
-│   │       ├── ucmr5-archive.ts
-│   │       ├── ucmr5-index.ts
-│   │       ├── ucmr5-producer.ts
-│   │       └── ucmr5-service.ts
+│   │   │   ├── sdwis-client.ts
+│   │   │   └── sdwis-code-labels.ts
+│   │   ├── ucmr5/
+│   │   │   ├── ucmr5-archive.ts
+│   │   │   ├── ucmr5-index.ts
+│   │   │   ├── ucmr5-producer.ts
+│   │   │   └── ucmr5-service.ts
+│   │   └── epa-http-error.ts
 │   └── index.ts
 ├── tests/
 │   ├── domain/
@@ -205,6 +208,7 @@ epa-drinking-water-mcp-server/
 │   └── tools/
 │       ├── dataframe-tools.test.ts
 │       ├── error-contracts.test.ts
+│       ├── sdwis-code-selectors.test.ts
 │       ├── sdwis-source-dates.test.ts
 │       ├── sdwis-source-tools.test.ts
 │       ├── source-markdown.test.ts
@@ -219,6 +223,7 @@ epa-drinking-water-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

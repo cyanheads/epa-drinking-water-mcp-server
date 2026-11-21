@@ -11,9 +11,9 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { crc32 } from 'node:zlib';
 import { z } from '@cyanheads/mcp-ts-core';
-import { httpErrorFromResponse } from '@cyanheads/mcp-ts-core/utils';
 import { parse } from 'csv-parse';
 import { openPromise, type ZipFile } from 'yauzl';
+import { discardEpaBody, epaHttpError } from '@/services/epa-http-error.js';
 import { additionalHeaders, occurrenceHeaders, zipHeaders } from '../../domain/ucmr5-schemas.js';
 import { datasetChanged, Ucmr5Index } from './ucmr5-index.js';
 
@@ -103,8 +103,11 @@ export async function downloadArchive(
   try {
     await chmod(directory, 0o700);
     const response = await archiveRequest(fetcher, 'GET', signal);
-    if (!response.ok)
-      throw await httpErrorFromResponse(response, { service: 'EPA UCMR', captureBody: false });
+    if (!response.ok) {
+      const error = await epaHttpError(response, 'UCMR');
+      await discardEpaBody(response, signal);
+      throw error;
+    }
     if (!response.body) throw datasetChanged('EPA returned an empty UCMR archive body.');
     const declared = response.headers.get('content-length');
     if (declared && Number(declared) > COMPRESSED_LIMIT) {

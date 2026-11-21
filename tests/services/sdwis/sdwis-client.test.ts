@@ -3,6 +3,7 @@
  * @module tests/services/sdwis/sdwis-client.test
  */
 import process from 'node:process';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { network, paced } from './sdwis-fixtures.js';
 
@@ -238,6 +239,54 @@ describe('DMAP network boundary', () => {
     expect(JSON.stringify(failure)).not.toContain('CONTACT-CANARY');
   });
   it.each([
+    [403, 1, 'upstream_forbidden'],
+    [429, 3, 'upstream_rate_limited'],
+  ] as const)(
+    'preserves HTTP %i when discarding an errored body',
+    async (status, attempts, reason) => {
+      http = network(
+        Array.from({ length: attempts }, () => ({
+          path,
+          response: () =>
+            new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.error(new TypeError('BODY-CANARY'));
+                },
+              }),
+              { status, headers: { 'retry-after': '2' } },
+            ),
+        })),
+      );
+      const expected = expect(paced(read())).rejects.toMatchObject({
+        data: { status, reason, retryable: attempts > 1 },
+      });
+      await expected;
+      expect(http.calls).toHaveLength(attempts);
+    },
+  );
+  it('preserves caller abort while discarding a failed HTTP response', async () => {
+    const caller = new AbortController();
+    const reason = new DOMException('caller stopped', 'AbortError');
+    http = network([
+      {
+        path,
+        response: () =>
+          new Response(
+            new ReadableStream({
+              cancel() {
+                caller.abort(reason);
+                throw new TypeError('BODY-CANARY');
+              },
+            }),
+            { status: 403 },
+          ),
+      },
+    ]);
+    await expect(paced(read(caller.signal))).rejects.toBe(reason);
+    expect(http.calls).toHaveLength(1);
+  });
+  it.each([
     { rows: [{ pwsid: 'WA1234567', population_served_count: '1' }] },
     { rows: [{ pwsid: 'OR1234567' }] },
     { rows: { error: 'CONTACT-CANARY' } },
@@ -308,11 +357,31 @@ describe('DMAP network boundary', () => {
     });
     try {
       await expect(paced(read())).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
         message: 'EPA DMAP could not complete after three attempts.',
+        data: { reason: 'upstream_unavailable', retryable: true },
       });
       expect(aborted).toEqual([true, true, true]);
     } finally {
       vi.restoreAllMocks();
     }
+  });
+  it('keeps exhausted network causes internal and marks the transport failure retryable', async () => {
+    const cause = new TypeError('NETWORK-CANARY');
+    http = network(
+      Array.from({ length: 3 }, () => ({
+        path,
+        response: () => {
+          throw cause;
+        },
+      })),
+    );
+    const error = await paced(read()).catch((failure: unknown) => failure);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      cause,
+      data: { reason: 'upstream_unavailable', retryable: true },
+    });
+    expect(JSON.stringify(error)).not.toContain('NETWORK-CANARY');
   });
 });

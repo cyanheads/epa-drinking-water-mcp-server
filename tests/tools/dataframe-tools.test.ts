@@ -426,7 +426,7 @@ describe('dataframe tool contracts', () => {
         table_name: h.table_name,
         row_count: 0,
         expires_at: h.expires_at,
-        columns: [{ name: 'value', type: 'VARCHAR', nullable: true }],
+        columns: [{ name: 'value', type: 'VARCHAR', engineType: 'VARCHAR', nullable: true }],
         source_complete: false,
         provenance: source.provenance,
         effective_filters: source.effective_filters,

@@ -6,23 +6,22 @@ import MarkdownIt from 'markdown-it';
 import { expect, vi } from 'vitest';
 
 const commonmark = new MarkdownIt('commonmark');
+const blockTypes = new Set(['paragraph_open', 'inline', 'paragraph_close']);
+const inlineTypes = new Set(['text', 'softbreak', 'hardbreak', 'link_open', 'link_close']);
 
 /** Read visible CommonMark text independently of the production Markdown encoder. */
 export function renderedText(text: string): string {
-  return commonmark
-    .parse(text, {})
-    .flatMap((block) => {
-      expect(['paragraph_open', 'inline', 'paragraph_close']).toContain(block.type);
-      return (block.children ?? []).map((token) => {
-        expect(['text', 'softbreak', 'hardbreak', 'link_open', 'link_close']).toContain(token.type);
-        return token.type === 'softbreak' || token.type === 'hardbreak'
-          ? '\n'
-          : token.type === 'text'
-            ? token.content
-            : '';
-      });
-    })
-    .join('');
+  const parts: string[] = [];
+  for (const block of commonmark.parse(text, {})) {
+    if (!blockTypes.has(block.type)) throw new Error(`Unexpected Markdown block: ${block.type}`);
+    for (const token of block.children ?? []) {
+      if (!inlineTypes.has(token.type))
+        throw new Error(`Unexpected inline Markdown: ${token.type}`);
+      if (token.type === 'text') parts.push(token.content);
+      if (token.type === 'softbreak' || token.type === 'hardbreak') parts.push('\n');
+    }
+  }
+  return parts.join('');
 }
 
 /** One expected request, including its full production URL path. */
@@ -84,20 +83,23 @@ export async function paced<T>(operation: Promise<T>): Promise<T> {
 
 /** Verify each primitive on the reversible text surface against its structured counterpart. */
 export function expectParity(result: { structuredContent?: unknown; content: unknown[] }) {
-  const lines = result.content.flatMap((block) => {
+  const lines = new Set<string>();
+  for (const block of result.content)
     if (block && typeof block === 'object' && 'text' in block && typeof block.text === 'string')
-      return renderedText(block.text).split('\n');
-    return [];
-  });
+      for (const line of renderedText(block.text).split('\n')) lines.add(line);
+  const requireLine = (line: string) => {
+    if (!lines.has(line)) throw new Error(`Missing rendered line: ${line}`);
+  };
   const visit = (value: unknown, path: string) => {
     if (Array.isArray(value)) {
-      if (!value.length) expect(lines).toContain(`${path} = []`);
+      if (!value.length) requireLine(`${path} = []`);
       for (const [index, child] of value.entries()) visit(child, `${path}[${index}]`);
     } else if (value !== null && typeof value === 'object') {
-      if (!Object.keys(value).length) expect(lines).toContain(`${path} = {}`);
-      for (const [key, child] of Object.entries(value))
+      const entries = Object.entries(value);
+      if (!entries.length) requireLine(`${path} = {}`);
+      for (const [key, child] of entries)
         visit(child, path ? `${path}.${JSON.stringify(key)}` : JSON.stringify(key));
-    } else if (value !== undefined) expect(lines).toContain(`${path} = ${JSON.stringify(value)}`);
+    } else if (value !== undefined) requireLine(`${path} = ${JSON.stringify(value)}`);
   };
   visit(result.structuredContent, '');
 }

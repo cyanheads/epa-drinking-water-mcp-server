@@ -644,13 +644,6 @@ describe('real UCMR producer through tool contract', () => {
       vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
       const http = network([
         {
-          path: /water_system\/state_code\/equals\/WA\//,
-          rows: [
-            { pwsid: 'WA1234567', state_code: 'WA' },
-            { pwsid: 'OR1234567', state_code: 'WA' },
-          ],
-        },
-        {
           path:
             county === 'King'
               ? /geographic_area\/county_served\/equals\/KING\//
@@ -659,6 +652,10 @@ describe('real UCMR producer through tool contract', () => {
             ...(county === 'King' ? [] : [{ pwsid: 'OR1234567', county_served: 'STEVENS' }]),
             { pwsid: 'WA1234567', county_served: county.toUpperCase() },
           ],
+        },
+        {
+          path: /water_system\/pwsid\/in\/WA1234567\/and\/state_code\/equals\/WA\//,
+          rows: [{ pwsid: 'WA1234567', state_code: 'WA' }],
         },
       ]);
       const result = data(
@@ -687,6 +684,32 @@ describe('real UCMR producer through tool contract', () => {
       });
     },
   );
+
+  it('reuses state membership while each contaminant search reads its own archive rows', async () => {
+    const service = install([
+      occurrence({ PWSID: 'NJ1234567', SampleID: 'pfoa', Contaminant: 'PFOA' }),
+      occurrence({ PWSID: 'NJ1234567', SampleID: 'pfos', Contaminant: 'PFOS' }),
+    ]);
+    (await service.acquire(new AbortController().signal)).release();
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const http = network([
+      {
+        path: '/dmapservice/sdwis.water_system/state_code/equals/NJ/sort/pwsid/1:1000/json',
+        rows: [{ pwsid: 'NJ1234567', state_code: 'NJ' }],
+      },
+    ]);
+    const input = { dataset: 'ucmr5' as const, state: 'NJ' };
+    const pfoa = data(await paced(runToolContract(tool, { ...input, contaminant: 'PFOA' })));
+    const pfos = data(await paced(runToolContract(tool, { ...input, contaminant: 'PFOS' })));
+    expect(pfoa).toMatchObject({ items: [{ sample_id: 'pfoa' }], source_complete: true });
+    expect(pfos).toMatchObject({ items: [{ sample_id: 'pfos' }], source_complete: true });
+    expect(pfos.notices).toEqual(
+      expect.arrayContaining([expect.stringContaining('Reused reported')]),
+    );
+    expect(pfos.provenance).toEqual(pfoa.provenance);
+    expect(pfos.selection_partition).not.toEqual(pfoa.selection_partition);
+    http.verify();
+  });
 
   it('detects a changed publication after a continuously active selection crosses refresh time', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });

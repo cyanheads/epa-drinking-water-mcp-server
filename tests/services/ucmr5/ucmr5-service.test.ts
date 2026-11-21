@@ -21,6 +21,45 @@ function service(fetcher: typeof fetch): Ucmr5Service {
   services.push(instance);
   return instance;
 }
+function erroredResponse(status: number) {
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(new TypeError('BODY-CANARY'));
+      },
+    }),
+    { status, headers: { 'retry-after': '1' } },
+  );
+}
+async function archiveFailure(instance: Ucmr5Service) {
+  const fakeSetTimeout = globalThis.setTimeout;
+  let backoff = Promise.withResolvers<number>();
+  const schedule = vi
+    .spyOn(globalThis, 'setTimeout')
+    .mockImplementation((callback, delay, ...args) => {
+      const timer = fakeSetTimeout(callback, delay, ...args);
+      if (delay !== undefined && delay <= 5000) backoff.resolve(delay);
+      return timer;
+    });
+  const failure = instance.acquire(signal()).catch((cause: unknown) => cause);
+  const delays: number[] = [];
+  try {
+    while (true) {
+      // Advance only after scratch-file cleanup has finished and the retry schedules its backoff.
+      const event = await Promise.race([
+        failure.then((error) => ({ error })),
+        backoff.promise.then((delay) => ({ delay })),
+      ]);
+      if ('error' in event) return { error: event.error, delays };
+      delays.push(event.delay);
+      expect(delays.length).toBeLessThanOrEqual(2);
+      backoff = Promise.withResolvers<number>();
+      await vi.advanceTimersByTimeAsync(Math.ceil(event.delay));
+    }
+  } finally {
+    schedule.mockRestore();
+  }
+}
 afterEach(async () => {
   await Promise.all(services.splice(0).map((instance) => instance.close()));
   vi.useRealTimers();
@@ -73,6 +112,157 @@ describe('UCMR shared acquisition and revision leases', () => {
       data: { status: 403 },
     });
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([405, 501])('falls back to GET when conditional HEAD returns %i', async (status) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-25T00:00:00Z'));
+    const fetcher = vi.fn<typeof fetch>(async (_url, init) =>
+      init?.method === 'HEAD'
+        ? new Response(null, { status })
+        : new Response(archive(), { headers: { etag: 'revision-a' } }),
+    );
+    const instance = service(fetcher);
+    (await instance.acquire(signal())).release();
+    vi.setSystemTime(new Date('2026-10-25T06:00:00Z'));
+    const lease = await instance.acquire(signal());
+    expect(fetcher.mock.calls.map((call) => call[1]?.method)).toEqual(['GET', 'HEAD', 'GET']);
+    expect(fetcher.mock.calls[1]?.[1]?.headers).toEqual({ 'If-None-Match': 'revision-a' });
+    expect(lease.measurements().occurrenceRows).toBe(1);
+    lease.release();
+  });
+
+  it.each([405, 501])('falls back after an errored HEAD %i body', async (status) => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const fetcher = vi.fn<typeof fetch>(async (_url, init) =>
+      init?.method === 'HEAD'
+        ? erroredResponse(status)
+        : new Response(archive(), { headers: { etag: 'revision-a' } }),
+    );
+    const instance = service(fetcher);
+    (await instance.acquire(signal())).release();
+    vi.setSystemTime(Date.now() + 6 * 3600000);
+    const pending = instance.acquire(signal());
+    const result = pending.then(
+      (lease) => ({ lease }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.advanceTimersByTimeAsync(10000);
+    const outcome = await result;
+    if ('error' in outcome) throw outcome.error;
+    outcome.lease.release();
+    expect(fetcher.mock.calls.map((call) => call[1]?.method)).toEqual(['GET', 'HEAD', 'GET']);
+  });
+
+  it.each([
+    ['GET', 403, 1, 'upstream_forbidden'],
+    ['HEAD', 403, 1, 'upstream_forbidden'],
+    ['GET', 429, 3, 'upstream_rate_limited'],
+    ['HEAD', 429, 3, 'upstream_rate_limited'],
+  ] as const)(
+    'preserves %s HTTP %i when discarding an errored body',
+    async (method, status, attempts, reason) => {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const fetcher = vi.fn<typeof fetch>(async (_url, init) =>
+        init?.method === method
+          ? erroredResponse(status)
+          : new Response(archive(), { headers: { etag: 'revision-a' } }),
+      );
+      const instance = service(fetcher);
+      if (method === 'HEAD') {
+        (await instance.acquire(signal())).release();
+        vi.setSystemTime(Date.now() + 6 * 3600000);
+      }
+      const { error, delays } = await archiveFailure(instance);
+      expect(fetcher.mock.calls.filter((call) => call[1]?.method === method)).toHaveLength(
+        attempts,
+      );
+      expect(delays).toEqual(attempts > 1 ? [1000, 1000] : []);
+      expect(error).toMatchObject({ data: { status, reason, retryable: attempts > 1 } });
+    },
+  );
+
+  it.each([
+    [503, 3, -32000, 'upstream_unavailable'],
+    [408, 3, -32004, 'upstream_timeout'],
+    [429, 3, -32003, 'upstream_rate_limited'],
+    [403, 1, -32005, 'upstream_forbidden'],
+    [400, 1, -32000, 'upstream_contract_changed'],
+    [404, 1, -32000, 'upstream_contract_changed'],
+    [501, 1, -32000, 'upstream_unavailable'],
+  ] as const)(
+    'maps cold archive HTTP %i and retains safe metadata',
+    async (status, attempts, code, reason) => {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const fetcher = vi.fn<typeof fetch>(
+        async () =>
+          new Response('BODY-CANARY', {
+            status,
+            headers: { 'retry-after': '1' },
+          }),
+      );
+      const { error, delays } = await archiveFailure(service(fetcher));
+      expect(fetcher).toHaveBeenCalledTimes(attempts);
+      expect(delays).toEqual(attempts > 1 ? [1000, 1000] : []);
+      expect(error).toMatchObject({
+        code,
+        data: {
+          status,
+          statusCode: status,
+          retryAfter: '1',
+          retryable: attempts > 1,
+          reason,
+          ...(attempts > 1 ? { retryAttempts: attempts } : {}),
+        },
+      });
+      expect(JSON.stringify(error)).not.toContain('BODY-CANARY');
+    },
+  );
+
+  it.each([new TypeError('NETWORK-CANARY'), new DOMException('NETWORK-CANARY', 'TimeoutError')])(
+    'classifies exhausted archive transport failures from %j',
+    async (cause) => {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const fetcher = vi.fn<typeof fetch>(async () => {
+        throw cause;
+      });
+      const { error } = await archiveFailure(service(fetcher));
+      expect(fetcher).toHaveBeenCalledTimes(3);
+      expect(error).toMatchObject({
+        code: -32000,
+        data: { reason: 'upstream_unavailable', retryable: true, retryAttempts: 3 },
+      });
+      expect(JSON.stringify(error)).not.toContain('NETWORK-CANARY');
+    },
+  );
+
+  it('classifies exhausted conditional HEAD failures while retaining the held lease', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const fetcher = vi.fn<typeof fetch>(async (_url, init) =>
+      init?.method === 'HEAD'
+        ? new Response(null, { status: 503 })
+        : new Response(archive(), { headers: { etag: 'revision-a' } }),
+    );
+    const instance = service(fetcher);
+    const lease = await instance.acquire(signal());
+    try {
+      vi.setSystemTime(Date.now() + 6 * 3600000);
+      const pending = instance.acquire(signal()).catch((failure: unknown) => failure);
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(fetcher.mock.calls.map((call) => call[1]?.method)).toEqual([
+        'GET',
+        'HEAD',
+        'HEAD',
+        'HEAD',
+      ]);
+      expect(await pending).toMatchObject({
+        code: -32000,
+        data: { reason: 'upstream_unavailable', status: 503, retryable: true, retryAttempts: 3 },
+      });
+      expect(lease.measurements().occurrenceRows).toBe(1);
+    } finally {
+      lease.release();
+    }
   });
 
   it('bounds a hung acquisition and aborts its request at the shared deadline', async () => {

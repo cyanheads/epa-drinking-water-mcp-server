@@ -28,6 +28,10 @@ export function optionalText(description: string) {
     )
     .describe(description);
 }
+/** Optional PWSID selector with semantic validation in normalizeSelectors. */
+export function optionalSystemId(description: string) {
+  return optionalText(description).meta({ pattern: optionalPwsidPattern });
+}
 /** Shared paging selectors; the effective inline cap is applied by the producer. */
 export const pagingFields = {
   cursor: optionalText(
@@ -37,9 +41,9 @@ export const pagingFields = {
 };
 /** Geographic membership selectors, resolved before querying fact tables. */
 export const geographyFields = {
-  pwsid: optionalText(
+  pwsid: optionalSystemId(
     'Exact nine-character alphanumeric PWSID from sdwis_search_water_systems; numeric tribal prefixes and alphabetic suffixes are valid.',
-  ).meta({ pattern: optionalPwsidPattern }),
+  ),
   state: optionalText(
     'Reported WATER_SYSTEM legal-entity postal state or territory name/code; not a physical service boundary.',
   ),
@@ -95,12 +99,17 @@ export function normalizeSelectors(input: Record<string, unknown>): Record<strin
         });
       result[key] = value.trim();
     }
-  if (typeof result.pwsid === 'string') {
-    result.pwsid = result.pwsid.toUpperCase();
-    if (!/^[A-Z0-9]{9}$/.test(String(result.pwsid)))
-      throw validationError('PWSID must contain nine letters or digits.', {
-        reason: 'invalid_selector',
-      });
+  for (const field of ['pwsid', 'seller_pwsid']) {
+    const value = result[field];
+    if (typeof value === 'string') {
+      const id = value.toUpperCase();
+      if (!/^[A-Z0-9]{9}$/.test(id))
+        throw validationError(
+          `${field === 'pwsid' ? 'PWSID' : 'Seller PWSID'} must contain nine letters or digits.`,
+          { reason: 'invalid_selector' },
+        );
+      result[field] = id;
+    }
   }
   if (typeof result.state === 'string') {
     result.state = normalizeState(result.state);

@@ -4,7 +4,7 @@ description: Investigate EPA water-system records and analyze contaminant eviden
 license: Apache-2.0
 metadata:
   author: "cyanheads"
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Scope
@@ -32,6 +32,8 @@ Use this keyless server for public-system research and historical EPA evidence. 
 For a utility investigation, resolve the system, inspect its profile, and retrieve the relevant historical evidence. To trace a violation, pass its PWSID and violation ID to `sdwis_get_enforcement_actions`. Retrieve association rows separately when reconstructing action-to-violation links; an action date filter does not define the association selection.
 
 When a treatment or violation references a facility, inspect that system's facilities section before attributing the record to a named source or treatment plant. A UCMR facility with a similar name or ID is not a verified cross-dataset match.
+
+To trace a reported purchase, take the `seller_pwsid` from a buyer’s facility record or resolve the seller by name. Pass that ID as `seller_pwsid` to `sdwis_search_water_systems`. Use `activity: "all"` to include inactive buyer systems. The listing includes historical facility connections. Check each buyer’s own regulatory records before attributing a finding to it.
 
 ## Workflows
 

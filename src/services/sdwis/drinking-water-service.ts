@@ -23,6 +23,7 @@ import {
   readPage,
   type SourcePage,
 } from './sdwis-client.js';
+import { emptySelectorNotices, enrichLabels } from './sdwis-code-labels.js';
 
 /** A source partition submitted to the real canvas service; no synthetic handles are minted here. */
 export interface SourcePartition {
@@ -98,31 +99,40 @@ const JOB_TTL_MS = 900000;
 const WORK_BUDGET_MS = 45000;
 /** Reserve time to serialize a resumable checkpoint after an awaited membership read stops. */
 const MEMBERSHIP_CHECKPOINT_RESERVE_MS = 5000;
+/** Leave time for registration when a staged empty result needs optional diagnostics. */
+const EMPTY_STAGE_RESERVE_MS = 5000;
 const PAGE_SIZE = 1000;
 /** PWSIDs per `pwsid in (...)` fact query. */
 const BATCH_SIZE = 50;
+/** PWSIDs per DMAP legal-entity confirmation request. */
+const CONFIRM_BATCH_SIZE = 200;
+const MEMBERSHIP_TTL_MS = 3600000;
+const MEMBERSHIP_CACHE_SIZE = 32;
 interface Job {
   associationOffset: number;
   associations: Set<string>;
   associationsComplete: boolean;
   batch: number;
+  confirmIds: string[];
   deliveredRows: number;
   filters: Record<string, unknown>;
   geographicIds: Set<string>;
   id: string;
   ids: string[];
   inFlight: boolean;
+  membershipScope?: string;
   offset: number;
   partition: number;
   pending: PublicRow[];
   periodOffset: number;
   periods: Map<string, PublicRow>;
   periodsComplete: boolean;
-  phase: 'inventory' | 'geography' | 'facts' | 'done';
+  phase: 'inventory' | 'geography' | 'seller' | 'confirm' | 'facts' | 'done';
   previousBoundary?: string;
   provenance?: SourcePage;
   referenceExtrasAdded: boolean;
   replay?: { step: number; fingerprint: string; result: SourceOutput };
+  reusedMembershipAt?: string;
   sourcePages: Map<string, { etag?: string; last_modified?: string; fingerprint: string }>;
   step: number;
   table: Table;
@@ -130,6 +140,7 @@ interface Job {
   touched: number;
 }
 const jobs = new Map<string, Job>();
+const completedMemberships = new Map<string, { ids: string[]; retrievedAtMs: number }>();
 const tokenSchema = z.object({
   job: z.string(),
   step: z.number().int(),
@@ -220,6 +231,20 @@ function getJob(
     (!filters.pwsid || Boolean(filters.state) || Boolean(filters.county)) &&
     table !== 'water_system' &&
     table !== 'ref_code_value';
+  const scope =
+    membership && typeof filters.state === 'string'
+      ? JSON.stringify([filters.state, filters.county])
+      : undefined;
+  const pwsid = typeof filters.pwsid === 'string' ? filters.pwsid : undefined;
+  const cached = scope ? completedMemberships.get(scope) : undefined;
+  const hit = cached && Date.now() - cached.retrievedAtMs < MEMBERSHIP_TTL_MS ? cached : undefined;
+  let phase: Job['phase'] = 'facts';
+  let ids: string[] = [];
+  if (hit) ids = pwsid ? hit.ids.filter((id) => id === pwsid) : hit.ids;
+  else if (filters.seller_pwsid) phase = 'seller';
+  else if (filters.county) phase = 'geography';
+  else if (membership) phase = 'inventory';
+  else if (pwsid) ids = [pwsid];
   const job: Job = {
     deliveredRows: 0,
     partition: 0,
@@ -230,17 +255,16 @@ function getJob(
     filters,
     step: 0,
     touched: Date.now(),
-    phase: membership
-      ? 'inventory'
-      : filters.county && table === 'water_system'
-        ? 'geography'
-        : 'facts',
+    phase,
+    ...(scope && !pwsid ? { membershipScope: scope } : {}),
+    ...(hit ? { reusedMembershipAt: new Date(hit.retrievedAtMs).toISOString() } : {}),
     offset: 1,
-    ids: !membership && typeof filters.pwsid === 'string' ? [filters.pwsid] : [],
+    ids,
     sourcePages: new Map(),
     referenceExtrasAdded: false,
     geographicIds: new Set(),
     batch: 0,
+    confirmIds: [],
     pending: [],
     periods: new Map(),
     periodsComplete: table !== 'lcr_sample_result',
@@ -251,6 +275,25 @@ function getJob(
   };
   jobs.set(job.id, job);
   return job;
+}
+/** Bind a completed, unrestricted scope to later selections without reusing fact state. */
+function finishMembership(job: Job): void {
+  if (job.membershipScope) {
+    const now = Date.now();
+    for (const [scope, entry] of completedMemberships)
+      if (now - entry.retrievedAtMs >= MEMBERSHIP_TTL_MS || scope === job.membershipScope)
+        completedMemberships.delete(scope);
+    if (completedMemberships.size === MEMBERSHIP_CACHE_SIZE) {
+      const oldest = completedMemberships.keys().next();
+      if (!oldest.done) completedMemberships.delete(oldest.value);
+    }
+    completedMemberships.set(job.membershipScope, { ids: job.ids, retrievedAtMs: now });
+  }
+  job.phase = 'facts';
+  job.offset = 1;
+  job.batch = 0;
+  job.confirmIds = [];
+  if (job.table !== 'water_system' || job.filters.seller_pwsid) job.geographicIds.clear();
 }
 function predicate(
   column: string,
@@ -287,12 +330,16 @@ function batchPredicate(job: Job): Predicate {
 }
 function factPredicates(job: Job): Predicate[] {
   const f = job.filters;
-  const selected =
-    job.table === 'water_system'
-      ? inventoryPredicates(f)
-      : job.table === 'ref_code_value'
-        ? predicate('value_type', f.value_type)
-        : [batchPredicate(job)];
+  if (job.table === 'water_system') {
+    if (!f.seller_pwsid) return inventoryPredicates(f);
+    // The seller scan already intersected the two ID selectors.
+    return [
+      batchPredicate(job),
+      ...inventoryPredicates({ ...f, pwsid: undefined, pwsid_prefix: undefined }),
+    ];
+  }
+  if (job.table === 'ref_code_value') return predicate('value_type', f.value_type);
+  const selected = [batchPredicate(job)];
   if (job.table === 'violation')
     selected.push(
       ...predicate(
@@ -378,75 +425,6 @@ function retain(job: Job, table: Table, page: SourcePage): void {
   });
   job.provenance = page;
 }
-/** One bounded entry per value type in labelColumns; install only fully acquired dictionaries. */
-const codeLabels = new Map<string, { labels: Map<string, string | null>; expires: number }>();
-/** Code columns decoded per table, each with its `ref_code_value` value type. */
-const labelColumns: Partial<Record<Table, [column: string, valueType: string][]>> = {
-  violation: [
-    ['contaminant_code', 'CONTAMINANT_CODE'],
-    ['violation_code', 'VIOLATION_CODE'],
-    ['violation_category_code', 'VIOLATION_CATEGORY_CODE'],
-  ],
-  enforcement_action: [['enforcement_action_type_code', 'ENFORCEMENT_ACTION_TYPE_CODE']],
-  water_system_facility: [['facility_type_code', 'FACILITY_TYPE_CODE']],
-  treatment: [
-    ['treatment_objective_code', 'TREATMENT_OBJECTIVE_CODE'],
-    ['treatment_process_code', 'TREATMENT_PROCESS_CODE'],
-  ],
-  lcr_sample_result: [['contaminant_code', 'CONTAMINANT_CODE']],
-};
-/** Decode source codes through composite dictionary keys; absent descriptions remain null. */
-async function enrichLabels(table: Table, rows: PublicRow[], signal: AbortSignal): Promise<number> {
-  let pages = 0;
-  for (const [column, valueType] of labelColumns[table] ?? []) {
-    let cached = codeLabels.get(valueType);
-    if (
-      rows.some((row) => typeof row[column] === 'string') &&
-      (!cached || cached.expires < Date.now())
-    ) {
-      const predicates: Predicate[] = [
-        { column: 'value_type', operator: 'equals', value: valueType },
-      ];
-      const labels = new Map<string, string | null>();
-      let offset = 1;
-      let publication: SourcePage | undefined;
-      while (true) {
-        const page = await readPage('ref_code_value', predicates, offset, PAGE_SIZE, signal);
-        pages++;
-        if (
-          publication &&
-          ((publication.etag && page.etag && publication.etag !== page.etag) ||
-            (publication.last_modified &&
-              page.last_modified &&
-              publication.last_modified !== page.last_modified))
-        )
-          throw conflict('EPA label dictionary changed during retrieval.', {
-            reason: 'source_changed',
-          });
-        publication = page;
-        for (const row of page.rows) {
-          const code = String(row.value_code);
-          if (labels.has(code))
-            throw serviceUnavailable('EPA repeated a label dictionary key without progress.', {
-              reason: 'upstream_paging_changed',
-            });
-          labels.set(
-            code,
-            typeof row.value_description === 'string' ? row.value_description : null,
-          );
-        }
-        offset += page.rows.length;
-        if (page.rows.length < PAGE_SIZE) break;
-      }
-      cached = { labels, expires: Date.now() + 3600000 };
-      codeLabels.set(valueType, cached);
-    }
-    for (const row of rows)
-      row[column.replace(/_code$/, '_label')] =
-        typeof row[column] === 'string' ? (cached?.labels.get(String(row[column])) ?? null) : null;
-  }
-  return pages;
-}
 /** Acquire source rows with scan checkpoints and a shared deadline, preserving pending rows exactly. */
 async function advance(
   job: Job,
@@ -459,10 +437,12 @@ async function advance(
   let unknown = 0;
   const workDeadline = Date.now() + WORK_BUDGET_MS;
   const membershipDeadline = workDeadline - MEMBERSHIP_CHECKPOINT_RESERVE_MS;
+  const usesIdBatches =
+    job.table !== 'ref_code_value' && (job.table !== 'water_system' || job.filters.seller_pwsid);
   let readMembership = false;
   /** Read and retain one membership or companion page. */
   const read = async (table: Table, predicates: Predicate[], offset: number) => {
-    const membership = job.phase === 'inventory' || job.phase === 'geography';
+    const membership = outputPhase(job) === 'membership';
     const checkpoint = new AbortController();
     const timer = membership
       ? setTimeout(
@@ -495,11 +475,7 @@ async function advance(
   };
   while (pages < 17 && job.pending.length < target && job.phase !== 'done') {
     signal.throwIfAborted();
-    if (
-      (job.phase === 'inventory' || job.phase === 'geography') &&
-      Date.now() >= membershipDeadline
-    )
-      break;
+    if (outputPhase(job) === 'membership' && Date.now() >= membershipDeadline) break;
     if (membershipOnly && job.phase === 'facts') break;
     // Do not begin fact I/O with less than one normal request window after a slow membership walk.
     if (readMembership && job.phase === 'facts' && workDeadline - Date.now() < 15000) break;
@@ -516,37 +492,79 @@ async function advance(
           reason: 'selection_capacity_exhausted',
         });
       job.offset += page.rows.length;
-      if (page.rows.length < PAGE_SIZE) {
-        job.phase = job.filters.county ? 'geography' : 'facts';
-        job.offset = 1;
-      }
+      if (page.rows.length < PAGE_SIZE) finishMembership(job);
       continue;
     }
-    if (job.phase === 'geography') {
-      const predicates = predicate('county_served', job.filters.county);
-      const page = await read('geographic_area', predicates, job.offset);
+    if (job.phase === 'seller' || job.phase === 'geography') {
+      const seller = job.phase === 'seller';
+      const predicates = seller
+        ? predicate('seller_pwsid', job.filters.seller_pwsid)
+        : predicate('county_served', job.filters.county);
+      const page = await read(
+        seller ? 'water_system_facility' : 'geographic_area',
+        predicates,
+        job.offset,
+      );
       if (!page) break;
       readMembership = true;
-      for (const row of page.rows)
-        if (matchesPredicates(row, predicates)) job.geographicIds.add(String(row.pwsid));
+      for (const row of page.rows) {
+        const id = String(row.pwsid);
+        if (job.filters.pwsid && id.toUpperCase() !== job.filters.pwsid) continue;
+        if (
+          typeof job.filters.pwsid_prefix === 'string' &&
+          !id.toUpperCase().startsWith(job.filters.pwsid_prefix)
+        )
+          continue;
+        if (matchesPredicates(row, predicates)) job.geographicIds.add(id);
+      }
       if (job.geographicIds.size > 100000)
-        throw rateLimited('County membership exceeds the selection budget; narrow the selection.', {
+        throw rateLimited('Membership exceeds the selection budget; narrow the selection.', {
           reason: 'selection_capacity_exhausted',
         });
       job.offset += page.rows.length;
       if (page.rows.length < PAGE_SIZE) {
-        if (job.table !== 'water_system')
-          job.ids = job.ids.filter((id) => job.geographicIds.has(id));
-        job.phase = 'facts';
         job.offset = 1;
+        if (seller) {
+          job.ids = [...job.geographicIds].sort();
+          if (job.filters.county && job.ids.length) {
+            job.geographicIds.clear();
+            job.phase = 'geography';
+          } else {
+            finishMembership(job);
+          }
+        } else if (job.table !== 'water_system') {
+          job.confirmIds = [...job.geographicIds].sort();
+          job.geographicIds.clear();
+          job.phase = 'confirm';
+        } else {
+          if (job.filters.seller_pwsid) job.ids = job.ids.filter((id) => job.geographicIds.has(id));
+          finishMembership(job);
+        }
       }
       continue;
     }
-    if (
-      job.table !== 'water_system' &&
-      job.table !== 'ref_code_value' &&
-      job.batch * BATCH_SIZE >= job.ids.length
-    ) {
+    if (job.phase === 'confirm') {
+      if (!job.confirmIds.length) {
+        finishMembership(job);
+        continue;
+      }
+      const candidates = job.confirmIds.slice(
+        job.batch * CONFIRM_BATCH_SIZE,
+        (job.batch + 1) * CONFIRM_BATCH_SIZE,
+      );
+      const predicates = [
+        { column: 'pwsid', operator: 'in', value: candidates.join(',') } satisfies Predicate,
+        ...predicate('state_code', job.filters.state),
+      ];
+      const page = await read('water_system', predicates, 1);
+      if (!page) break;
+      readMembership = true;
+      job.ids.push(...new Set(page.rows.map((row) => String(row.pwsid))));
+      job.batch++;
+      if (job.batch * CONFIRM_BATCH_SIZE >= job.confirmIds.length) finishMembership(job);
+      continue;
+    }
+    if (usesIdBatches && job.batch * BATCH_SIZE >= job.ids.length) {
       job.phase = 'done';
       break;
     }
@@ -604,6 +622,7 @@ async function advance(
       if (
         job.table === 'water_system' &&
         job.filters.county &&
+        !job.filters.seller_pwsid &&
         !job.geographicIds.has(String(row.pwsid))
       )
         continue;
@@ -637,12 +656,7 @@ async function advance(
     }
     job.offset += page.rows.length;
     if (page.rows.length < PAGE_SIZE) {
-      if (
-        job.table === 'water_system' ||
-        job.table === 'ref_code_value' ||
-        (job.batch + 1) * BATCH_SIZE >= job.ids.length
-      )
-        job.phase = 'done';
+      if (!usesIdBatches || (job.batch + 1) * BATCH_SIZE >= job.ids.length) job.phase = 'done';
       else {
         job.batch++;
         job.offset = 1;
@@ -657,7 +671,11 @@ async function advance(
   return { examined, unknown };
 }
 function outputPhase(job: Job): SourceOutput['phase'] {
-  return job.phase === 'inventory' || job.phase === 'geography' ? 'membership' : 'source';
+  return job.phase === 'facts' || job.phase === 'done' ? 'source' : 'membership';
+}
+/** Describe cached EPA scope provenance separately from the fact page's provenance. */
+function membershipReuseNotice(retrievedAt: string): string {
+  return `Reused reported geographic membership retrieved at ${retrievedAt}.`;
 }
 function provenance(job: Job): SourceOutput['provenance'] {
   return {
@@ -704,7 +722,12 @@ export async function resolveMembership(
     cursor?: string | undefined;
   },
   ctx: Context,
-): Promise<{ pwsids: ReadonlySet<string>; source_complete: boolean; next_cursor?: string }> {
+): Promise<{
+  pwsids: ReadonlySet<string>;
+  source_complete: boolean;
+  next_cursor?: string;
+  reuseNotice?: string;
+}> {
   const normalized = normalizeSelectors({ ...input });
   const job = getJob('sdwis_membership', 'violation', selectionFilters(normalized), input.cursor);
   if (job.inFlight)
@@ -720,6 +743,9 @@ export async function resolveMembership(
       pwsids: new Set(complete ? job.ids : []),
       source_complete: complete,
       ...(complete ? {} : { next_cursor: sign(job) }),
+      ...(job.reusedMembershipAt
+        ? { reuseNotice: membershipReuseNotice(job.reusedMembershipAt) }
+        : {}),
     };
   } finally {
     job.inFlight = false;
@@ -778,6 +804,9 @@ export async function produceSource(
     }
     const stageMax = Math.min(25000, Number(input.stage_max_rows ?? 5000));
     const notices = [caveat, ...limitNotices];
+    if (job.reusedMembershipAt) notices.push(membershipReuseNotice(job.reusedMembershipAt));
+    if (job.filters.seller_pwsid)
+      notices.push('Reported purchase connections include inactive facilities.');
     if (Number(input.stage_max_rows ?? 5000) > 25000)
       notices.push('Requested stage_max_rows was clamped to 25000.');
     if (input.activity === 'active')
@@ -785,6 +814,7 @@ export async function produceSource(
         'Discovery includes active systems by default; use activity all to include inactive records.',
       );
     const result = envelope(job, limit, notices);
+    const workDeadline = Date.now() + WORK_BUDGET_MS;
     const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(WORK_BUDGET_MS)]);
     const overlapCounts = await advance(job, normalized.stage ? stageMax : limit + 1, signal);
     if (overlapCounts.unknown)
@@ -800,6 +830,17 @@ export async function produceSource(
       const rows = ucmrReferenceProvider?.() ?? [];
       job.pending.push(...rows.filter((row) => matchesQuery(row, input.query)));
       job.referenceExtrasAdded = true;
+    }
+    if (job.phase === 'done' && job.pending.length === 0 && job.deliveredRows === 0) {
+      const diagnosticSignal = normalized.stage
+        ? AbortSignal.any([
+            signal,
+            AbortSignal.timeout(Math.max(0, workDeadline - Date.now() - EMPTY_STAGE_RESERVE_MS)),
+          ])
+        : signal;
+      notices.push(
+        ...(await emptySelectorNotices(table, job.filters, diagnosticSignal, ctx.signal)),
+      );
     }
     const staged =
       normalized.stage && outputPhase(job) !== 'membership'

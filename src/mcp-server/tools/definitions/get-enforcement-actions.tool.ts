@@ -33,7 +33,9 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
     ...dateFields,
     ...pagingFields,
     action_type: optionalText('Exact enforcement-action type code; actions section only.'),
-    originator: optionalText('Exact reported originator code; actions section only.'),
+    originator: optionalText(
+      'Exact case-insensitive originator code, such as F, H, R, or S. Actions section only.',
+    ),
     stage: z
       .boolean()
       .default(false)
@@ -92,10 +94,40 @@ export const getEnforcementActionsTool = tool('sdwis_get_enforcement_actions', {
         'Repeat the same source tool without cursor to retrieve the newly published source revision.',
     },
     {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      thrownBy: 'service',
+      when: 'EPA reports a server error or transport attempts are exhausted.',
+      recovery: 'Retry the source tool later when the EPA endpoint is available.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'The EPA endpoint returned HTTP 408.',
+      recovery: 'Retry the source tool with narrower selectors or try again later.',
+    },
+    {
+      reason: 'upstream_rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'The EPA endpoint returned HTTP 429.',
+      recovery: 'Wait before retrying the source tool and reduce concurrent calls.',
+    },
+    {
+      reason: 'upstream_forbidden',
+      code: JsonRpcErrorCode.Forbidden,
+      thrownBy: 'service',
+      when: 'The EPA endpoint refused the request with HTTP 403.',
+      recovery: 'Check whether the EPA endpoint is accessible from this server before retrying.',
+    },
+    {
       reason: 'upstream_contract_changed',
       code: JsonRpcErrorCode.ServiceUnavailable,
       thrownBy: 'service',
-      when: 'EPA action or association schema changed.',
+      when: 'The fixed EPA endpoint rejected the request or the action or association schema changed.',
       recovery:
         'Retry the source tool later; the EPA response no longer matches the verified table contract.',
     },

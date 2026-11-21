@@ -266,7 +266,7 @@ describe('real canvas service', () => {
       cpu: process.cpuUsage(cpu),
     });
   });
-  it('pages all live tables including empty schemas, rejects changed metadata, and clamps table limits', async () => {
+  it('pages all 16 live tables including empty tables and clamps table limits', async () => {
     const h = await f.service.stageRelations(
       {},
       output(true),
@@ -295,7 +295,16 @@ describe('real canvas service', () => {
       has_more: false,
       notices: ['Requested limit 501 exceeds the maximum 500; clamped to 500.'],
     });
+  });
+  it('rejects a describe cursor after dropping a table and rejects a fabricated cursor', async () => {
+    const h = await f.service.stageRelations(
+      {},
+      output(true),
+      [relation, { ...relation, relation: 'second_partition', rows: [] }],
+      f.ctx,
+    );
     const first = await f.service.describe({ canvas_id: h.canvas_id, limit: 1 }, f.ctx);
+    expect(first.next_cursor).toEqual(expect.any(String));
     await f.service.drop(h, f.ctx);
     await expect(
       f.service.describe({ canvas_id: h.canvas_id, limit: 1, cursor: first.next_cursor }, f.ctx),

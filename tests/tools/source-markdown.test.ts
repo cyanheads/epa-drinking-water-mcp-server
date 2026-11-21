@@ -16,6 +16,21 @@ afterEach(() => {
 });
 
 describe('literal source Markdown', () => {
+  it('requires the full value at each index even when multiple rows contain it', () => {
+    const row = { value: 'identical value 💧' };
+    const structuredContent = { items: [row, row] };
+    expectParity({ structuredContent, content: formatSource(structuredContent) });
+    expect(() =>
+      expectParity({ structuredContent, content: formatSource({ items: [row] }) }),
+    ).toThrow('"items"[1]."value"');
+    expect(() =>
+      expectParity({
+        structuredContent,
+        content: formatSource({ items: [row, { value: 'identical value' }] }),
+      }),
+    ).toThrow('"items"[1]."value" = "identical value 💧"');
+  });
+
   it('preserves enforcement comments through the real handler and fake EPA HTTP', async () => {
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
     const http = network([

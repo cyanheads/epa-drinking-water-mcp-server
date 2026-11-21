@@ -24,6 +24,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import { resolveInlineLimit } from '@/domain/inline-limit.js';
 import { type PublicRow, type Table, tableSchemas } from '@/domain/sdwis-contracts.js';
+import { labelColumns, labelField } from '@/domain/sdwis-label-columns.js';
 import type { SelectionCoverage, SourceOutput } from '@/domain/source-output.js';
 import type { SourcePartition } from '@/services/sdwis/drinking-water-service.js';
 
@@ -140,7 +141,11 @@ export interface QueryInput {
 function sourceSchema(table: Table, rows: PublicRow[]): ColumnSchema[] {
   const json = tableSchemas[table].toJSONSchema();
   const properties = json.properties ?? {};
-  const names = new Set([...Object.keys(properties), ...rows.flatMap((row) => Object.keys(row))]);
+  const names = new Set([
+    ...Object.keys(properties),
+    ...(labelColumns[table] ?? []).map(([column]) => labelField(column)),
+    ...rows.flatMap((row) => Object.keys(row)),
+  ]);
   return [...names].map((name) => {
     const property = properties[name];
     const numeric =
@@ -313,7 +318,7 @@ export class CanvasService {
     signal: AbortSignal,
   ): Promise<TableInfo[]> {
     signal.throwIfAborted();
-    const tables = await instance.describe();
+    const tables = await instance.describe({ signal });
     signal.throwIfAborted();
     for (const key of state.tables.keys())
       if (!tables.some((table) => table.name === key)) state.tables.delete(key);
@@ -463,7 +468,7 @@ export class CanvasService {
             });
             ctx.signal.throwIfAborted();
           }
-          const tables = await instance.describe();
+          const tables = await instance.describe({ signal: ctx.signal });
           ctx.signal.throwIfAborted();
           for (const [index, relation] of relations.entries()) {
             const name = created[index];

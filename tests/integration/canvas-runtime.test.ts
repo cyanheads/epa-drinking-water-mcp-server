@@ -113,6 +113,25 @@ it.each([
     );
     const staged = await call('sdwis_get_violations', { pwsid: 'WA1234567', stage: true });
     const dataset = staged?.dataset as { canvas_id: string; table_name: string };
+    expect(
+      await call('sdwis_dataframe_describe', {
+        canvas_id: dataset.canvas_id,
+        table_name: dataset.table_name,
+      }),
+    ).toMatchObject({
+      items: [
+        {
+          table_name: dataset.table_name,
+          columns: expect.arrayContaining([
+            expect.objectContaining({
+              name: 'violation_id',
+              type: 'VARCHAR',
+              engineType: 'VARCHAR',
+            }),
+          ]),
+        },
+      ],
+    });
     const query = (sql: string, extra = {}) =>
       call('sdwis_dataframe_query', { canvas_id: dataset.canvas_id, sql, ...extra });
     expect(
@@ -120,6 +139,16 @@ it.each([
     ).toMatchObject({
       items: [{ violation_id: 'fixture-violation' }, { violation_id: 'second-violation' }],
       truncated: false,
+    });
+    expect(
+      await query(
+        `SELECT violation_id AS selected_violation FROM ${dataset.table_name} ORDER BY violation_id`,
+      ),
+    ).toMatchObject({
+      items: [
+        { selected_violation: 'fixture-violation' },
+        { selected_violation: 'second-violation' },
+      ],
     });
     const joins = Array.from(
       { length: 14 },
@@ -159,6 +188,10 @@ it.each([
     for (const [args, reason] of [
       [{ sql: 'SELECT 1', cursor: 'unknown' }, 'cursor_invalid'],
       [{ sql: 'SELECT * FROM absent_table' }, 'missing_table'],
+      [
+        { sql: `SELECT violation_id AS duckdb_columns FROM ${dataset.table_name}` },
+        'system_catalog_access',
+      ],
     ] as const) {
       const reply = (await request('tools/call', {
         name: 'sdwis_dataframe_query',
@@ -169,7 +202,7 @@ it.each([
         structuredContent: { error: { data: { reason } } },
       });
       expect(JSON.stringify(reply.result.content)).toContain(reason);
-      if (reason === 'missing_table') {
+      if (reason !== 'cursor_invalid') {
         expect(reply.result.structuredContent).toMatchObject({
           error: {
             data: { recovery: { hint: expect.stringContaining('sdwis_dataframe_describe') } },

@@ -4,18 +4,26 @@
  */
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { geographyFields, optionalText, pagingFields } from '@/domain/source-inputs.js';
+import {
+  geographyFields,
+  optionalSystemId,
+  optionalText,
+  pagingFields,
+} from '@/domain/source-inputs.js';
 import { formatSource, sourceOutputShape } from '@/domain/source-output.js';
 import { produceSource } from '@/services/sdwis/drinking-water-service.js';
 
 /** Find public systems before selecting profiles or historical fact records. */
 export const searchWaterSystemsTool = tool('sdwis_search_water_systems', {
   description:
-    'Find public water systems by name, PWSID, reported legal-entity state, county served, population, activity, source or school/daycare indicator. Supply at least one narrowing selector. Discovery defaults to active systems; activity all includes inactive inventory. School/daycare and wholesaler indicators are reported system attributes, not an inventory of every institution receiving water. State and county matches do not establish complete physical service boundaries. Pass a returned PWSID to sdwis_get_system_profile; continue incomplete selections with the same filters and next_cursor.',
+    'Find public water systems by name, PWSID, reported legal-entity state, county served, population, activity, source, school/daycare indicator or reported seller connection. Supply at least one narrowing selector. Discovery defaults to active systems; activity all includes inactive inventory. Seller connections are reported facility records, including inactive facility connections. They do not establish current supply or service boundaries. School/daycare and wholesaler indicators are reported system attributes, not an inventory of every institution receiving water. State and county matches do not establish complete physical service boundaries. Pass a returned PWSID to sdwis_get_system_profile; continue incomplete selections with the same filters and next_cursor.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     ...geographyFields,
     ...pagingFields,
+    seller_pwsid: optionalSystemId(
+      'Exact seller PWSID on buyer facility records. Facility activity does not restrict this match; activity filters buyer system inventory.',
+    ),
     name_contains: optionalText('Case-insensitive substring of the reported system name.'),
     school_or_daycare: z
       .boolean()
@@ -77,10 +85,48 @@ export const searchWaterSystemsTool = tool('sdwis_search_water_systems', {
         'Repeat the same source tool with the original filters and omit cursor to begin again.',
     },
     {
+      reason: 'source_changed',
+      code: JsonRpcErrorCode.Conflict,
+      thrownBy: 'service',
+      when: 'EPA discovery metadata changed during retrieval.',
+      recovery:
+        'Repeat the same source tool without cursor to retrieve the newly published source revision.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      thrownBy: 'service',
+      when: 'EPA reports a server error or transport attempts are exhausted.',
+      recovery: 'Retry the source tool later when the EPA endpoint is available.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'The EPA endpoint returned HTTP 408.',
+      recovery: 'Retry the source tool with narrower selectors or try again later.',
+    },
+    {
+      reason: 'upstream_rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'The EPA endpoint returned HTTP 429.',
+      recovery: 'Wait before retrying the source tool and reduce concurrent calls.',
+    },
+    {
+      reason: 'upstream_forbidden',
+      code: JsonRpcErrorCode.Forbidden,
+      thrownBy: 'service',
+      when: 'The EPA endpoint refused the request with HTTP 403.',
+      recovery: 'Check whether the EPA endpoint is accessible from this server before retrying.',
+    },
+    {
       reason: 'upstream_contract_changed',
       code: JsonRpcErrorCode.ServiceUnavailable,
       thrownBy: 'service',
-      when: 'EPA schema or predicates differ from the verified contract.',
+      when: 'The fixed EPA endpoint rejected the request or its schema or predicates differ from the verified contract.',
       recovery:
         'Retry the source tool later; the EPA response no longer matches the verified table contract.',
     },
@@ -97,6 +143,7 @@ export const searchWaterSystemsTool = tool('sdwis_search_water_systems', {
     if (
       ![
         input.pwsid,
+        input.seller_pwsid,
         input.name_contains,
         input.state,
         input.county,

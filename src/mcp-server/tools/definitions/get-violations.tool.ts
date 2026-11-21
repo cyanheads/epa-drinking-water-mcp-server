@@ -25,17 +25,17 @@ export const getViolationsTool = tool('sdwis_get_violations', {
     ...dateFields,
     ...pagingFields,
     contaminant: optionalText(
-      'Exact SDWIS contaminant code or lead, arsenic, nitrate, TTHM; lead selects 1030 and Lead and Copper Rule code 5000, including copper/monitoring records; not a UCMR family selector.',
+      'Exact SDWIS contaminant code or lead, arsenic, nitrate, TTHM; lead selects 1030 and Lead and Copper Rule code 5000, including copper/monitoring records. For UCMR analytes or the PFAS family, use sdwis_search_contaminants with dataset ucmr5.',
     ),
     category: optionalText(
-      'Exact violation-category code; preserves monitoring/reporting distinctions.',
+      'Exact case-insensitive violation-category code, such as MCL, MRDL, TT, MR, or Other.',
     ),
     health_based: z
       .boolean()
       .optional()
       .describe('Filter the source Y/N health-based indicator; unknown indicators are not false.'),
     compliance_status: optionalText(
-      'Exact source compliance-status code, not a current safety verdict.',
+      'Exact case-insensitive source compliance-status code, such as I, K, O, or R.',
     ),
     stage: z
       .boolean()
@@ -105,10 +105,40 @@ export const getViolationsTool = tool('sdwis_get_violations', {
         'Repeat the same source tool without cursor to retrieve the newly published source revision.',
     },
     {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      thrownBy: 'service',
+      when: 'EPA reports a server error or transport attempts are exhausted.',
+      recovery: 'Retry the source tool later when the EPA endpoint is available.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'The EPA endpoint returned HTTP 408.',
+      recovery: 'Retry the source tool with narrower selectors or try again later.',
+    },
+    {
+      reason: 'upstream_rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      thrownBy: 'service',
+      when: 'The EPA endpoint returned HTTP 429.',
+      recovery: 'Wait before retrying the source tool and reduce concurrent calls.',
+    },
+    {
+      reason: 'upstream_forbidden',
+      code: JsonRpcErrorCode.Forbidden,
+      thrownBy: 'service',
+      when: 'The EPA endpoint refused the request with HTTP 403.',
+      recovery: 'Check whether the EPA endpoint is accessible from this server before retrying.',
+    },
+    {
       reason: 'upstream_contract_changed',
       code: JsonRpcErrorCode.ServiceUnavailable,
       thrownBy: 'service',
-      when: 'EPA table no longer matches verified public schema.',
+      when: 'The fixed EPA endpoint rejected the request or violation rows fail the verified public schema.',
       recovery:
         'Retry the source tool later; the EPA response no longer matches the verified table contract.',
     },

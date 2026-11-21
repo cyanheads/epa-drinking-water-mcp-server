@@ -2,8 +2,9 @@
  * @fileoverview Awaited, leased UCMR revision lifecycle with shared cancellable acquisition.
  * @module services/ucmr5/ucmr5-service
  */
-import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import { httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { McpError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { discardEpaBody, epaHttpError } from '@/services/epa-http-error.js';
 import type { Ucmr5Occurrence } from '../../domain/ucmr5-schemas.js';
 import {
   archiveRequest,
@@ -16,26 +17,48 @@ import type { Ucmr5Index, Ucmr5Selection } from './ucmr5-index.js';
 const FRESH_MS = 6 * 60 * 60 * 1000;
 const LOAD_MS = 180000;
 
-function isTransient(cause: unknown): boolean {
-  if (!(cause instanceof Error) || cause.name === 'AbortError') return false;
-  if (cause instanceof TypeError || cause.name === 'TimeoutError') return true;
-  if (
-    'code' in cause &&
-    ['ECONNRESET', 'ETIMEDOUT', 'ERR_STREAM_PREMATURE_CLOSE', 'ConnectionClosed'].includes(
-      String(cause.code),
-    )
-  )
-    return true;
+function isTransportFailure(cause: unknown): boolean {
   return (
-    'data' in cause &&
-    typeof cause.data === 'object' &&
-    cause.data !== null &&
-    'status' in cause.data &&
-    [408, 429, 500, 502, 503, 504].includes(Number(cause.data.status))
+    cause instanceof Error &&
+    cause.name !== 'AbortError' &&
+    (cause instanceof TypeError ||
+      cause.name === 'TimeoutError' ||
+      ('code' in cause &&
+        ['ECONNRESET', 'ETIMEDOUT', 'ERR_STREAM_PREMATURE_CLOSE', 'ConnectionClosed'].includes(
+          String(cause.code),
+        )))
   );
 }
+
 /** Shared by the revalidation HEAD and the archive download. */
-const retryPolicy = { maxRetries: 2, baseDelayMs: 1000, maxDelayMs: 5000, isTransient };
+function retryArchive<T>(
+  read: (signal: AbortSignal) => Promise<T>,
+  deadlineMs: number,
+  signal: AbortSignal,
+): Promise<T> {
+  return withRetry(
+    async ({ signal: attemptSignal }) => {
+      try {
+        return await read(attemptSignal);
+      } catch (cause) {
+        if (attemptSignal.aborted || !isTransportFailure(cause)) throw cause;
+        throw serviceUnavailable(
+          'EPA UCMR transport failed.',
+          { reason: 'upstream_unavailable', retryable: true },
+          { cause },
+        );
+      }
+    },
+    {
+      maxRetries: 2,
+      baseDelayMs: 1000,
+      maxDelayMs: 5000,
+      isTransient: (error) => error instanceof McpError && error.data?.retryable === true,
+      deadlineMs,
+      signal,
+    },
+  );
+}
 
 function waitFor<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
@@ -178,8 +201,8 @@ export class Ucmr5Service {
   private async refresh(signal: AbortSignal): Promise<void> {
     if (this.index && this.revision && (this.revision.etag || this.revision.last_modified)) {
       const revision = this.revision;
-      const metadata = await withRetry(
-        async ({ signal: attemptSignal }) => {
+      const metadata = await retryArchive(
+        async (attemptSignal) => {
           const response = await archiveRequest(
             this.fetcher,
             'HEAD',
@@ -190,15 +213,13 @@ export class Ucmr5Service {
                 ? { 'If-Modified-Since': revision.last_modified }
                 : {},
           );
-          await response.body?.cancel();
+          await discardEpaBody(response, attemptSignal);
           if (!response.ok && ![304, 405, 501].includes(response.status))
-            throw await httpErrorFromResponse(response, {
-              service: 'EPA UCMR',
-              captureBody: false,
-            });
+            throw await epaHttpError(response, 'UCMR');
           return response;
         },
-        { ...retryPolicy, deadlineMs: 45000, signal },
+        45000,
+        signal,
       );
       // A 405/501 HEAD falls through to a full download and SHA-256 comparison.
       if (
@@ -213,9 +234,10 @@ export class Ucmr5Service {
         return;
       }
     }
-    const downloaded = await withRetry(
-      ({ signal: attemptSignal }) => downloadArchive(this.fetcher, attemptSignal),
-      { ...retryPolicy, deadlineMs: LOAD_MS, signal },
+    const downloaded = await retryArchive(
+      (attemptSignal) => downloadArchive(this.fetcher, attemptSignal),
+      LOAD_MS,
+      signal,
     );
     try {
       if (this.index && this.revision?.archive_sha256 === downloaded.revision.archive_sha256) {

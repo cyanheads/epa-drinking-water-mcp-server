@@ -62,6 +62,262 @@ const violationPath = /^\/dmapservice\/sdwis\.violation\//;
 const dictionaryPath = /^\/dmapservice\/sdwis\.ref_code_value\//;
 
 describe('SDWIS source tool wiring', () => {
+  it('keeps explicit discovery PWSID and default active inventory predicates together', async () => {
+    http = network([
+      {
+        path: /water_system\/pwsid\/equals\/WA1234567\/and\/pws_activity_code\/equals\/A\//,
+        rows: [{ pwsid: 'WA1234567', pws_activity_code: 'A' }],
+      },
+    ]);
+    expect(data(await paced(runToolContract(search, { pwsid: 'wa1234567' })))).toMatchObject({
+      items: [{ pwsid: 'WA1234567' }],
+      source_complete: true,
+    });
+  });
+
+  it('discovers distinct reported buyers across inventory batches and continuations', async () => {
+    const ids = Array.from({ length: 51 }, (_, i) => `WA${String(i).padStart(7, '0')}`);
+    const facilities = ids.map((pwsid) => ({
+      pwsid,
+      facility_id: '1',
+      seller_pwsid: 'WA5377050',
+      facility_activity_code: 'I',
+    }));
+    http = network([
+      {
+        path: /water_system_facility\/seller_pwsid\/equals\/WA5377050\/sort\/pwsid:asc,facility_id:asc\/1:1000\/json$/,
+        rows: [facilities[0], { ...facilities[0], facility_id: '2' }, ...facilities.slice(1)],
+      },
+      {
+        path: `/dmapservice/sdwis.water_system/pwsid/in/${ids.slice(0, 50).join('%2C')}/sort/pwsid/1:1000/json`,
+        rows: ids.slice(0, 50).map((pwsid) => ({ pwsid })),
+      },
+      {
+        path: '/dmapservice/sdwis.water_system/pwsid/in/WA0000050/sort/pwsid/1:1000/json',
+        rows: [{ pwsid: 'WA0000050' }],
+      },
+    ]);
+    const input = { seller_pwsid: ' wa5377050 ', activity: 'all', limit: 50 } as const;
+    const first = data(await paced(runToolContract(search, input)));
+    expect(first).toMatchObject({
+      items: ids.slice(0, 50).map((pwsid) => expect.objectContaining({ pwsid })),
+      has_more: true,
+      source_complete: false,
+      effective_filters: { seller_pwsid: 'WA5377050' },
+    });
+    expect(first.notices).toContain('Reported purchase connections include inactive facilities.');
+    const cursor = String(first.next_cursor);
+    error(
+      await runToolContract(search, { ...input, seller_pwsid: 'WA5377051', cursor }),
+      'cursor_invalid',
+    );
+    const second = data(await paced(runToolContract(search, { ...input, cursor })));
+    expect(second).toMatchObject({
+      items: [expect.objectContaining({ pwsid: 'WA0000050' })],
+      has_more: false,
+      source_complete: false,
+    });
+    expect(second).not.toHaveProperty('next_cursor');
+  });
+
+  it('rejects a malformed seller ID and intersects reported buyer, county and system activity', async () => {
+    const invalid = await runToolContract(search, { seller_pwsid: 'bad/id' });
+    error(invalid, 'invalid_selector');
+    expect(JSON.stringify(invalid.content)).toContain('Recovery:');
+    expect(http.calls).toEqual([]);
+    http = network([
+      {
+        path: /water_system_facility\/seller_pwsid\/equals\/WA5377050\//,
+        rows: [
+          { pwsid: 'WA1234567', facility_id: '1', seller_pwsid: 'WA5377050' },
+          { pwsid: 'WA1234568', facility_id: '1', seller_pwsid: 'WA5377050' },
+        ],
+      },
+      {
+        path: /geographic_area\/county_served\/equals\/KING\//,
+        rows: [
+          { pwsid: 'WA1234567', county_served: 'King' },
+          { pwsid: 'WA1234569', county_served: 'King' },
+        ],
+      },
+      {
+        path: '/dmapservice/sdwis.water_system/pwsid/in/WA1234567/and/state_code/equals/WA/and/pws_activity_code/equals/A/sort/pwsid/1:1000/json',
+        rows: [{ pwsid: 'WA1234567', state_code: 'WA', pws_activity_code: 'A' }],
+      },
+      { path: /water_system_facility\/seller_pwsid\/equals\/ZZZZZZZZZ\//, rows: [] },
+    ]);
+    const result = data(
+      await paced(
+        runToolContract(search, {
+          seller_pwsid: 'WA5377050',
+          state: 'WA',
+          county: 'King',
+        }),
+      ),
+    );
+    expect(result).toMatchObject({ items: [{ pwsid: 'WA1234567' }], source_complete: true });
+    const empty = data(await paced(runToolContract(search, { seller_pwsid: 'ZZZZZZZZZ' })));
+    expect(empty).toMatchObject({ items: [], has_more: false, source_complete: true });
+    expect(empty).not.toHaveProperty('next_cursor');
+  });
+
+  it('continues a capped seller scan at the next facility offset', async () => {
+    const result = { pwsid: 'WA1234567', seller_pwsid: 'WA5377050' };
+    const prefix =
+      '/dmapservice/sdwis.water_system_facility/seller_pwsid/equals/WA5377050/sort/pwsid:asc,facility_id:asc';
+    http = network([
+      {
+        path: `${prefix}/1:1000/json`,
+        rows: Array.from({ length: 1000 }, (_, i) => ({
+          ...result,
+          facility_id: String(i).padStart(4, '0'),
+        })),
+      },
+      {
+        path: `${prefix}/1001:2000/json`,
+        response: (signal) =>
+          new Promise<Response>((_resolve, reject) =>
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+          ),
+      },
+      { path: `${prefix}/1001:2000/json`, rows: [] },
+      {
+        path: '/dmapservice/sdwis.water_system/pwsid/in/WA1234567/sort/pwsid/1:1000/json',
+        rows: [{ pwsid: 'WA1234567' }],
+      },
+    ]);
+    const input = { seller_pwsid: 'WA5377050', activity: 'all' } as const;
+    const first = data(await paced(runToolContract(search, input)));
+    expect(first).toMatchObject({ phase: 'membership', items: [], has_more: true });
+    expect(first).not.toHaveProperty('selection_partition');
+    const final = data(
+      await paced(runToolContract(search, { ...input, cursor: String(first.next_cursor) })),
+    );
+    expect(final).toMatchObject({
+      items: [{ pwsid: 'WA1234567' }],
+      source_complete: true,
+      has_more: false,
+    });
+  });
+
+  it('checkpoints county confirmation at 200 IDs and only caches the completed scope', async () => {
+    const ids = Array.from({ length: 201 }, (_, i) => `WA${String(i).padStart(7, '0')}`);
+    const firstId = 'WA0000000';
+    const lastId = 'WA0000200';
+    const geography = {
+      path: /geographic_area\/county_served\/equals\/KING\//,
+      rows: ids.map((pwsid) => ({ pwsid, county_served: 'King' })).reverse(),
+    };
+    const firstConfirm = {
+      path: `/dmapservice/sdwis.water_system/pwsid/in/${ids.slice(0, 200).join('%2C')}/and/state_code/equals/WA/sort/pwsid/1:1000/json`,
+      rows: [{ pwsid: firstId, state_code: 'WA' }],
+    };
+    const lastConfirm = {
+      path: '/dmapservice/sdwis.water_system/pwsid/in/WA0000200/and/state_code/equals/WA/sort/pwsid/1:1000/json',
+      rows: [{ pwsid: lastId, state_code: 'WA' }],
+    };
+    const facts = {
+      path: '/dmapservice/sdwis.violation/pwsid/in/WA0000000%2CWA0000200/sort/pwsid:asc,violation_id:asc/1:1000/json',
+      rows: [
+        { pwsid: firstId, violation_id: 'first' },
+        { pwsid: lastId, violation_id: 'last' },
+      ],
+    };
+    http = network([
+      geography,
+      firstConfirm,
+      {
+        path: lastConfirm.path,
+        response: (signal) =>
+          new Promise<Response>((_resolve, reject) =>
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+          ),
+      },
+      geography,
+      firstConfirm,
+      lastConfirm,
+      facts,
+      lastConfirm,
+      facts,
+      facts,
+    ]);
+    const input = { state: 'WA', county: 'King' };
+    const checkpoint = data(await paced(runToolContract(violations, input)));
+    expect(checkpoint).toMatchObject({ phase: 'membership', items: [], has_more: true });
+    const cold = data(await paced(runToolContract(violations, input)));
+    expect(cold).toMatchObject({ items: facts.rows, source_complete: true });
+    const resumed = data(
+      await paced(
+        runToolContract(violations, { ...input, cursor: String(checkpoint.next_cursor) }),
+      ),
+    );
+    const hit = data(await paced(runToolContract(violations, { ...input, county: 'King County' })));
+    expect(hit).toMatchObject({ items: facts.rows, source_complete: true });
+    expect(hit.notices).toEqual(
+      expect.arrayContaining([expect.stringContaining('Reused reported')]),
+    );
+    expect(resumed.items).toEqual(hit.items);
+    expect(resumed.selection_partition).not.toEqual(hit.selection_partition);
+  });
+
+  it('keeps restricted memberships out of the shared cache and evicts its oldest completed scope', async () => {
+    const county = (i: number) => ({
+      path: new RegExp(`sdwis\\.geographic_area/county_served/equals/TEST${i}/`),
+      rows: [],
+    });
+    http = network([county(0), ...Array.from({ length: 33 }, (_, i) => county(i)), county(0)]);
+    const base = { state: 'WA', county: 'test0' };
+    expect(
+      data(await paced(runToolContract(violations, { ...base, pwsid: 'WA1234567' }))),
+    ).toMatchObject({ items: [], source_complete: true });
+    for (let i = 0; i < 33; i++)
+      expect(
+        data(await paced(runToolContract(violations, { state: 'WA', county: `test${i}` }))),
+      ).toMatchObject({ items: [], source_complete: true });
+    const hit = data(await paced(runToolContract(violations, { ...base, county: 'test1' })));
+    expect(hit.notices).toEqual(
+      expect.arrayContaining([expect.stringContaining('Reused reported')]),
+    );
+    const evicted = data(await paced(runToolContract(violations, base)));
+    expect(evicted.notices).not.toEqual(
+      expect.arrayContaining([expect.stringContaining('Reused reported')]),
+    );
+  });
+
+  it('reuses full state membership across distinct fact selections until acquisition expires', async () => {
+    const inventory = {
+      path: /water_system\/state_code\/equals\/WA\//,
+      rows: [{ pwsid: 'WA1234567', state_code: 'WA' }],
+    };
+    const facts = (indicator: string) => ({
+      path: `/dmapservice/sdwis.violation/pwsid/in/WA1234567/and/is_health_based_ind/equals/${indicator}/sort/pwsid:asc,violation_id:asc/1:1000/json`,
+      rows: [],
+    });
+    http = network([inventory, facts('Y'), facts('N'), inventory, facts('N')]);
+    const cold = data(
+      await paced(runToolContract(violations, { state: 'WA', health_based: true })),
+    );
+    const hit = data(
+      await paced(runToolContract(violations, { state: 'Washington', health_based: false })),
+    );
+    expect(hit).toMatchObject({
+      items: [],
+      source_complete: true,
+      effective_filters: { state: 'WA' },
+    });
+    expect(hit.notices).toContain(
+      'Reused reported geographic membership retrieved at 2026-10-25T00:00:00.000Z.',
+    );
+    expect(hit.selection_partition).not.toEqual(cold.selection_partition);
+    expect(hit.provenance).toMatchObject({ url: expect.stringContaining('sdwis.violation') });
+    vi.setSystemTime(new Date('2026-10-25T01:00:00Z'));
+    const expired = data(
+      await paced(runToolContract(violations, { state: 'WA', health_based: false })),
+    );
+    expect(expired.notices).not.toEqual(
+      expect.arrayContaining([expect.stringContaining('Reused')]),
+    );
+  });
   it('rejects exactly ASCII controls while preserving C1 and Unicode literal selectors', async () => {
     const { normalizeSelectors } = await import('../../src/domain/source-inputs.js');
     for (let code = 0; code <= 159; code++) {
@@ -471,6 +727,7 @@ describe('SDWIS source tool wiring', () => {
         ],
       },
       { path: /value_type\/equals\/ENFORCEMENT_ACTION_TYPE_CODE\//, rows: [] },
+      { path: /value_type\/equals\/ORIGINATOR_CODE\//, rows: [] },
     ]);
     const result = data(
       await paced(
@@ -509,15 +766,15 @@ describe('SDWIS source tool wiring', () => {
     async (section) => {
       http = network([
         {
-          path: /water_system\/pwsid\/equals\/WA1234567\/and\/state_code\/equals\/WA\//,
-          rows: [{ pwsid: 'WA1234567', state_code: 'WA' }],
-        },
-        {
           path: /geographic_area\/county_served\/beginsWith\/ST\//,
           rows: [
             { pwsid: 'OR1234567', county_served: 'St. Clair' },
             { pwsid: 'WA1234567', county_served: 'St. Clair' },
           ],
+        },
+        {
+          path: /water_system\/pwsid\/in\/WA1234567\/and\/state_code\/equals\/WA\//,
+          rows: [{ pwsid: 'WA1234567', state_code: 'WA' }],
         },
         ...(section === 'actions'
           ? [
@@ -744,7 +1001,7 @@ describe('SDWIS source tool wiring', () => {
       expect(stage).toHaveBeenCalledTimes(1);
       http.verify();
       http = network([{ path: waterPath, rows: [] }]);
-      const empty = data(await paced(runToolContract(definition, input)));
+      const empty = data(await paced(runToolContract(definition, { ...input, state: 'OR' })));
       expect(empty).toMatchObject({
         items: [],
         has_more: false,
@@ -765,7 +1022,11 @@ describe('SDWIS source tool wiring', () => {
         },
       ]);
       const cancelled = await paced(
-        runToolContract(definition, input, { context: { signal: caller.signal } }),
+        runToolContract(
+          definition,
+          { ...input, state: 'CA' },
+          { context: { signal: caller.signal } },
+        ),
       );
       expect(cancelled).toMatchObject({
         isError: true,
@@ -1026,10 +1287,13 @@ describe('SDWIS source tool wiring', () => {
       const ids = Array.from({ length: 50 }, (_, i) => `WA${String(i).padStart(7, '0')}`);
       const etag = `"${'revision'.repeat(2000)}"`;
       http = network([
-        { path: waterPath, rows: ids.map((pwsid) => ({ pwsid, state_code: 'WA' })) },
         {
           path: /geographic_area\/county_served\/equals\/KING\//,
           rows: ids.map((pwsid) => ({ pwsid, county_served: 'KING' })),
+        },
+        {
+          path: `/dmapservice/sdwis.water_system/pwsid/in/${ids.join('%2C')}/and/state_code/equals/WA/sort/pwsid/1:1000/json`,
+          rows: ids.map((pwsid) => ({ pwsid, state_code: 'WA' })),
         },
         ...(mode === 'lcr'
           ? [
@@ -1154,6 +1418,7 @@ describe('SDWIS source tool wiring', () => {
           enforcement_id,
           enforcement_action_type_code: code,
           enforcement_action_type_label: 'Literal action',
+          originator_label: null,
         })),
       );
       expect(result).toMatchObject({
@@ -1189,6 +1454,7 @@ describe('SDWIS source tool wiring', () => {
         rows.map((row, index) => ({
           ...row,
           enforcement_action_type_label: index === 3 ? null : actions[index],
+          originator_label: null,
         })),
       );
     }
@@ -1347,7 +1613,6 @@ describe('SDWIS source tool wiring', () => {
 
   it('exhausts broad county pages before intersecting exact membership and returns an empty match', async () => {
     http = network([
-      { path: waterPath, rows: [{ pwsid: 'WA1234567', state_code: 'WA' }] },
       {
         path: /geographic_area\/county_served\/beginsWith\/ST\/.*\/1:1000\/json$/,
         rows: Array.from({ length: 1000 }, (_, i) => ({
@@ -1360,7 +1625,7 @@ describe('SDWIS source tool wiring', () => {
     expect(
       data(await paced(runToolContract(violations, { state: 'WA', county: 'St. Clair' }))),
     ).toMatchObject({ items: [], returned: 0, has_more: false, source_complete: true });
-    expect(http.calls).toHaveLength(3);
+    expect(http.calls).toHaveLength(2);
   });
 
   it('rejects control characters in literal selectors with recovery before HTTP', async () => {
@@ -1469,8 +1734,11 @@ describe('SDWIS source tool wiring', () => {
         kind === 'search'
           ? [geography, { path: waterPath, rows: inventory }]
           : [
-              { path: waterPath, rows: inventory },
               geography,
+              {
+                path: /water_system\/pwsid\/in\/OR1234567%2CWA1234567\/and\/state_code\/equals\/WA\//,
+                rows: [inventory[0]],
+              },
               {
                 path: /violation\/pwsid\/in\/WA1234567\//,
                 rows: [{ pwsid: 'WA1234567', violation_id: 'one' }],
@@ -1530,7 +1798,6 @@ describe('SDWIS source tool wiring', () => {
     async (mode) => {
       const caller = new AbortController();
       http = network([
-        { path: waterPath, rows: [{ pwsid: 'WA1234567', state_code: 'WA' }] },
         {
           path: /geographic_area\/county_served\/equals\/KING\//,
           response: (signal) =>
@@ -1571,6 +1838,10 @@ describe('SDWIS source tool wiring', () => {
         {
           path: /geographic_area\/county_served\/equals\/KING\//,
           rows: [{ pwsid: 'OR1234567', county_served: 'KING', state_served: 'WA' }],
+        },
+        {
+          path: /water_system\/pwsid\/in\/OR1234567\/and\/state_code\/equals\/WA\//,
+          rows: [],
         },
       ]);
       expect(
@@ -2007,13 +2278,6 @@ describe('SDWIS source tool wiring', () => {
   it('exhausts state and county membership before facts and retains composite IDs', async () => {
     http = network([
       {
-        path: /water_system\/state_code\/equals\/WA\//,
-        rows: [
-          { pwsid: 'WA1234567', state_code: 'WA' },
-          { pwsid: '01234567A', state_code: 'WA' },
-        ],
-      },
-      {
         path: /geographic_area\/county_served\/equals\/KING\//,
         rows: [
           { pwsid: 'WA1234567', county_served: 'KING', geo_id: null, state_served: null },
@@ -2021,7 +2285,14 @@ describe('SDWIS source tool wiring', () => {
         ],
       },
       {
-        path: /violation\/pwsid\/in\/WA1234567%2C01234567A\//,
+        path: /water_system\/pwsid\/in\/01234567A%2CWA1234567\/and\/state_code\/equals\/WA\//,
+        rows: [
+          { pwsid: '01234567A', state_code: 'WA' },
+          { pwsid: 'WA1234567', state_code: 'WA' },
+        ],
+      },
+      {
+        path: /violation\/pwsid\/in\/01234567A%2CWA1234567\//,
         rows: [
           {
             pwsid: 'WA1234567',
