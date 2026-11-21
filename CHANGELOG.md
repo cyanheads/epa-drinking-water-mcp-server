@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-11-21 · ⚠️ Breaking
+
+Find reported water buyers by seller PWSID and reuse completed geographic membership across EPA analyses.
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-11-03 · ⚠️ Breaking
 
 Page whole records and broaden EPA drinking-water research.
